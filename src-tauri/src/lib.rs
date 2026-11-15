@@ -3660,6 +3660,20 @@ fn spawn_telemetry_server(
     });
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GitCommitEvidence {
+    pub hash: String,
+    pub timestamp: String,
+    pub repo: String,
+    pub message: String,
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub insertions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShiftSession {
     pub start_ts: u64,
@@ -3667,6 +3681,20 @@ pub struct ShiftSession {
     pub time_in_str: String,
     #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub active_minutes: u32,
+    #[serde(default)]
+    pub idle_minutes: u32,
+    #[serde(default)]
+    pub network_stamp: Option<String>,
+    #[serde(default)]
+    pub app_minutes: HashMap<String, u32>,
+    #[serde(default)]
+    pub commit_evidence: Vec<GitCommitEvidence>,
+    #[serde(default)]
+    pub challenges: String,
+    #[serde(default)]
+    pub learnings: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3680,6 +3708,26 @@ pub struct CompletedShift {
     pub activities: Vec<String>,
     #[serde(default)]
     pub summary_markdown: String,
+    #[serde(default)]
+    pub active_minutes: u32,
+    #[serde(default)]
+    pub idle_minutes: u32,
+    #[serde(default)]
+    pub focus_percent: f32,
+    #[serde(default)]
+    pub network_stamp_in: Option<String>,
+    #[serde(default)]
+    pub network_stamp_out: Option<String>,
+    #[serde(default)]
+    pub app_breakdown: HashMap<String, u32>,
+    #[serde(default)]
+    pub commit_evidence: Vec<GitCommitEvidence>,
+    #[serde(default)]
+    pub challenges: String,
+    #[serde(default)]
+    pub learnings: String,
+    #[serde(default)]
+    pub verification_hash: String,
 }
 
 fn default_target_hours() -> f64 {
@@ -3702,6 +3750,12 @@ pub struct OjtStateFile {
     pub today_date: String,
     #[serde(default)]
     pub today_activities: Vec<String>,
+    #[serde(default)]
+    pub today_commits: Vec<GitCommitEvidence>,
+    #[serde(default)]
+    pub today_challenges: String,
+    #[serde(default)]
+    pub today_learnings: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3717,6 +3771,12 @@ pub struct OjtDashboardResponse {
     pub active_shift: Option<ShiftSession>,
     pub completed_shifts: Vec<CompletedShift>,
     pub today_activities: Vec<String>,
+    pub today_commits: Vec<GitCommitEvidence>,
+    pub today_challenges: String,
+    pub today_learnings: String,
+    pub current_focus_percent: f32,
+    pub top_active_apps: Vec<(String, u32)>,
+    pub current_network_stamp: String,
 }
 
 type SharedOjtState = Arc<Mutex<OjtStateFile>>;
@@ -3735,8 +3795,19 @@ struct WinSystemTime {
 }
 
 #[cfg(target_os = "windows")]
+#[repr(C)]
+struct LastInputInfo {
+    cb_size: u32,
+    dw_time: u32,
+}
+
+#[cfg(target_os = "windows")]
 unsafe extern "system" {
     fn GetLocalTime(lp_system_time: *mut WinSystemTime);
+    fn GetTickCount() -> u32;
+    fn GetLastInputInfo(plii: *mut LastInputInfo) -> i32;
+    fn GetForegroundWindow() -> isize;
+    fn GetWindowTextW(h_wnd: isize, lp_string: *mut u16, n_max_count: i32) -> i32;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3894,9 +3965,215 @@ fn reconcile_ojt_day(state: &mut OjtStateFile, today: &str) {
     } else if state.today_date != today {
         state.today_date = today.to_string();
         state.today_activities.clear();
+        state.today_commits.clear();
+        state.today_challenges.clear();
+        state.today_learnings.clear();
     }
     if state.target_hours <= 0.0 || !state.target_hours.is_finite() {
         state.target_hours = default_target_hours();
+    }
+}
+
+fn default_workstation_stamp() -> String {
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "Local".to_string());
+    let cleaned = host.trim();
+    if cleaned.is_empty() {
+        "Workstation: Local".to_string()
+    } else {
+        format!("Workstation: {}", cleaned)
+    }
+}
+
+fn capture_network_stamp() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("netsh");
+        cmd.args(["wlan", "show", "interfaces"]);
+        cmd.creation_flags(0x08000000);
+        if let Ok(output) = cmd.output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut connected = false;
+                let mut ssid: Option<String> = None;
+                for raw_line in text.lines() {
+                    let line = raw_line.trim();
+                    if let Some((key, val)) = line.split_once(':') {
+                        let k = key.trim();
+                        let v = val.trim();
+                        if k.eq_ignore_ascii_case("State") {
+                            connected = v.eq_ignore_ascii_case("connected");
+                        } else if k.eq_ignore_ascii_case("SSID") && !v.is_empty() && v != "None" {
+                            ssid = Some(v.to_string());
+                        }
+                    }
+                }
+                if let Some(name) = ssid {
+                    if connected {
+                        return format!("Wi-Fi: {}", name);
+                    }
+                }
+            }
+        }
+    }
+    default_workstation_stamp()
+}
+
+fn cached_startup_network_stamp() -> String {
+    static STARTUP_STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STARTUP_STAMP.get_or_init(capture_network_stamp).clone()
+}
+
+fn classify_active_app(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.contains("antigravity") {
+        return Some("Antigravity".to_string());
+    }
+    if lower.contains("visual studio code") || lower.ends_with(" - code") {
+        return Some("VS Code".to_string());
+    }
+    if lower.contains("powershell")
+        || lower.contains("windows terminal")
+        || lower.contains("command prompt")
+        || lower.contains("cmd.exe")
+        || lower.contains("wezterm")
+        || lower.contains("alacritty")
+    {
+        return Some("Terminal".to_string());
+    }
+    if lower.contains("chrome")
+        || lower.contains("microsoft edge")
+        || lower.contains("firefox")
+        || lower.contains("brave")
+        || lower.contains("arc")
+    {
+        return Some("Browser".to_string());
+    }
+    if lower.contains("obsidian") {
+        return Some("Obsidian".to_string());
+    }
+    if lower.contains("blender") {
+        return Some("Blender".to_string());
+    }
+    if lower.contains("figma") {
+        return Some("Figma".to_string());
+    }
+    if lower.contains("dinobuds") || lower.contains("ojtpulse") {
+        return Some("DinoBuds".to_string());
+    }
+    let app_tail = trimmed
+        .rsplit(" - ")
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if app_tail.is_empty() {
+        None
+    } else {
+        Some(truncate_str(app_tail, 24))
+    }
+}
+
+fn sample_user_activity() -> (bool, Option<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut lii = LastInputInfo {
+            cb_size: std::mem::size_of::<LastInputInfo>() as u32,
+            dw_time: 0,
+        };
+        let ok = unsafe { GetLastInputInfo(&mut lii) };
+        let is_active = if ok != 0 {
+            let now_tick = unsafe { GetTickCount() };
+            now_tick.wrapping_sub(lii.dw_time) <= 300_000
+        } else {
+            false
+        };
+
+        let hwnd = unsafe { GetForegroundWindow() };
+        let app_label = if hwnd != 0 {
+            let mut buf = [0u16; 512];
+            let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+            if len > 0 {
+                let title = String::from_utf16_lossy(&buf[..len as usize]);
+                classify_active_app(&title)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        return (is_active, app_label);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (true, None)
+    }
+}
+
+fn compute_verification_hash(
+    date_str: &str,
+    time_in: &str,
+    time_out: &str,
+    rendered_hours: f64,
+    commit_hashes: &str,
+    active_minutes: u32,
+) -> String {
+    let payload = format!(
+        "{}|{}|{}|{:.2}|{}|{}",
+        date_str, time_in, time_out, rendered_hours, commit_hashes, active_minutes
+    );
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in payload.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("OJT-{:016X}", hash)
+}
+
+fn parse_ymd(date_str: &str) -> Option<(i64, u32, u32)> {
+    let mut parts = date_str.trim().split('-');
+    let y = parts.next()?.parse::<i64>().ok()?;
+    let m = parts.next()?.parse::<u32>().ok()?;
+    let d = parts.next()?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+fn iso_week_number(date_str: &str) -> (i64, u32) {
+    let (y, m, d) = parse_ymd(date_str).unwrap_or_else(|| {
+        let clock = current_local_clock();
+        (clock.year, clock.month, clock.day)
+    });
+    let z = days_from_civil(y, m, d);
+    let dow0 = (z + 3).rem_euclid(7);
+    let thu = z + (3 - dow0);
+    let (ty, _, _) = civil_from_days(thu);
+    let jan1 = days_from_civil(ty, 1, 1);
+    let week = ((thu - jan1) / 7 + 1) as u32;
+    (ty, week)
+}
+
+fn day_of_week_name(date_str: &str) -> &'static str {
+    let Some((y, m, d)) = parse_ymd(date_str) else {
+        return "";
+    };
+    let z = days_from_civil(y, m, d);
+    match (z + 4).rem_euclid(7) {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        _ => "",
     }
 }
 
@@ -3924,10 +4201,18 @@ fn load_ojt_state() -> OjtStateFile {
             completed_shifts: Vec::new(),
             today_date: today.clone(),
             today_activities: Vec::new(),
+            today_commits: Vec::new(),
+            today_challenges: String::new(),
+            today_learnings: String::new(),
         });
 
     if state.watched_repos.is_empty() {
         state.watched_repos = discover_default_watched_repos();
+    }
+    if let Some(ref mut shift) = state.active_shift {
+        if shift.network_stamp.as_deref().unwrap_or("").trim().is_empty() {
+            shift.network_stamp = Some(cached_startup_network_stamp());
+        }
     }
     reconcile_ojt_day(&mut state, &today);
     state
@@ -3938,6 +4223,17 @@ fn round_two_decimals(v: f64) -> f64 {
         return 0.0;
     }
     (v * 100.0).round() / 100.0
+}
+
+fn top_apps_sorted(app_map: &HashMap<String, u32>, limit: usize) -> Vec<(String, u32)> {
+    let mut apps: Vec<(String, u32)> = app_map
+        .iter()
+        .filter(|(_, mins)| **mins > 0)
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    apps.truncate(limit);
+    apps
 }
 
 fn build_ojt_dashboard(state: &OjtStateFile) -> OjtDashboardResponse {
@@ -3958,6 +4254,42 @@ fn build_ojt_dashboard(state: &OjtStateFile) -> OjtDashboardResponse {
     };
     let estimated_completion_date = estimate_completion_date(clock, shifts_remaining);
 
+    let (current_focus_percent, top_active_apps, current_network_stamp) =
+        if let Some(ref shift) = state.active_shift {
+            let total = shift.active_minutes + shift.idle_minutes;
+            let focus = if total > 0 {
+                ((shift.active_minutes as f32 / total as f32) * 1000.0).round() / 10.0
+            } else {
+                0.0
+            };
+            let apps = top_apps_sorted(&shift.app_minutes, 4);
+            let net = shift
+                .network_stamp
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(cached_startup_network_stamp);
+            (focus, apps, net)
+        } else {
+            let latest_focus = state
+                .completed_shifts
+                .first()
+                .filter(|s| s.date_str == state.today_date)
+                .map(|s| s.focus_percent)
+                .unwrap_or(0.0);
+            let latest_apps = state
+                .completed_shifts
+                .first()
+                .filter(|s| s.date_str == state.today_date)
+                .map(|s| top_apps_sorted(&s.app_breakdown, 4))
+                .unwrap_or_default();
+            (latest_focus, latest_apps, cached_startup_network_stamp())
+        };
+
+    let mut merged_commits = state.today_commits.clone();
+    if let Some(ref shift) = state.active_shift {
+        merge_commit_evidence(&mut merged_commits, &shift.commit_evidence);
+    }
+
     OjtDashboardResponse {
         target_hours,
         rendered_hours,
@@ -3970,6 +4302,12 @@ fn build_ojt_dashboard(state: &OjtStateFile) -> OjtDashboardResponse {
         active_shift: state.active_shift.clone(),
         completed_shifts: state.completed_shifts.clone(),
         today_activities: state.today_activities.clone(),
+        today_commits: merged_commits,
+        today_challenges: state.today_challenges.clone(),
+        today_learnings: state.today_learnings.clone(),
+        current_focus_percent,
+        top_active_apps,
+        current_network_stamp,
     }
 }
 
@@ -3984,8 +4322,60 @@ fn push_unique_activity(list: &mut Vec<String>, item: String) {
     }
 }
 
-fn scan_git_and_agent_activities(watched_repos: &[String]) -> Vec<String> {
+fn merge_commit_evidence(target: &mut Vec<GitCommitEvidence>, incoming: &[GitCommitEvidence]) {
+    for ev in incoming {
+        if let Some(existing) = target.iter_mut().find(|c| {
+            c.repo.eq_ignore_ascii_case(&ev.repo) && c.hash.eq_ignore_ascii_case(&ev.hash)
+        }) {
+            if existing.files_changed == 0 && ev.files_changed > 0 {
+                existing.files_changed = ev.files_changed;
+                existing.insertions = ev.insertions;
+                existing.deletions = ev.deletions;
+            }
+        } else {
+            target.push(ev.clone());
+        }
+    }
+}
+
+fn parse_git_shortstat(line: &str) -> (u32, u32, u32) {
+    let mut files = 0u32;
+    let mut insertions = 0u32;
+    let mut deletions = 0u32;
+    for seg in line.split(',') {
+        let s = seg.trim();
+        let num = s
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.parse::<u32>().ok())
+            .unwrap_or(0);
+        if s.contains("file") {
+            files = num;
+        } else if s.contains("insertion") {
+            insertions = num;
+        } else if s.contains("deletion") {
+            deletions = num;
+        }
+    }
+    (files, insertions, deletions)
+}
+
+fn format_commit_bullet(ev: &GitCommitEvidence) -> String {
+    if ev.files_changed > 0 {
+        format!(
+            "[{}] {} ({}) {} [{}f, +{} / -{}]",
+            ev.repo, ev.hash, ev.timestamp, ev.message, ev.files_changed, ev.insertions, ev.deletions
+        )
+    } else {
+        format!("[{}] {} ({}) {}", ev.repo, ev.hash, ev.timestamp, ev.message)
+    }
+}
+
+fn scan_git_and_agent_activities(
+    watched_repos: &[String],
+) -> (Vec<String>, Vec<GitCommitEvidence>) {
     let mut found: Vec<String> = Vec::new();
+    let mut commits: Vec<GitCommitEvidence> = Vec::new();
     let now = now_secs();
 
     for repo_raw in watched_repos {
@@ -4003,7 +4393,16 @@ fn scan_git_and_agent_activities(watched_repos: &[String]) -> Vec<String> {
             .unwrap_or("repo");
 
         let mut cmd = Command::new("git");
-        cmd.args(["-C", repo, "log", "--since=midnight", "--oneline", "--no-merges"]);
+        cmd.args([
+            "-C",
+            repo,
+            "log",
+            "--since=midnight",
+            "--pretty=format:COMMIT|%h|%ad|%s",
+            "--date=format:%H:%M",
+            "--shortstat",
+            "--no-merges",
+        ]);
         #[cfg(target_os = "windows")]
         {
             cmd.creation_flags(0x08000000);
@@ -4011,14 +4410,55 @@ fn scan_git_and_agent_activities(watched_repos: &[String]) -> Vec<String> {
         if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    let trimmed = line.trim();
+                let mut current: Option<GitCommitEvidence> = None;
+
+                let mut finalize = |ev_opt: Option<GitCommitEvidence>| {
+                    if let Some(ev) = ev_opt {
+                        push_unique_activity(&mut found, format_commit_bullet(&ev));
+                        merge_commit_evidence(&mut commits, &[ev]);
+                    }
+                };
+
+                for raw_line in text.lines() {
+                    let trimmed = raw_line.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let formatted = format!("[{}] {}", repo_name, truncate_str(trimmed, 100));
-                    push_unique_activity(&mut found, formatted);
+                    if let Some(rest) = trimmed.strip_prefix("COMMIT|") {
+                        finalize(current.take());
+                        let mut parts = rest.splitn(3, '|');
+                        let hash = parts.next().unwrap_or("").trim();
+                        let timestamp = parts.next().unwrap_or("").trim();
+                        let message = parts.next().unwrap_or("").trim();
+                        if !hash.is_empty() {
+                            current = Some(GitCommitEvidence {
+                                hash: hash.to_string(),
+                                timestamp: if timestamp.is_empty() {
+                                    "--:--".to_string()
+                                } else {
+                                    timestamp.to_string()
+                                },
+                                repo: repo_name.to_string(),
+                                message: truncate_str(message, 100),
+                                files_changed: 0,
+                                insertions: 0,
+                                deletions: 0,
+                            });
+                        }
+                    } else if trimmed.contains("file changed")
+                        || trimmed.contains("files changed")
+                        || trimmed.contains("insertion")
+                        || trimmed.contains("deletion")
+                    {
+                        if let Some(ref mut ev) = current {
+                            let (f, ins, del) = parse_git_shortstat(trimmed);
+                            ev.files_changed = f;
+                            ev.insertions = ins;
+                            ev.deletions = del;
+                        }
+                    }
                 }
+                finalize(current.take());
             }
         }
     }
@@ -4081,7 +4521,50 @@ fn scan_git_and_agent_activities(watched_repos: &[String]) -> Vec<String> {
         }
     }
 
-    found
+    (found, commits)
+}
+
+fn spawn_ojt_pow_watcher(ojt_state: SharedOjtState) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let (has_active, needs_net) = {
+            let state = lock_or_recover(&ojt_state);
+            match state.active_shift {
+                Some(ref s) => (
+                    true,
+                    s.network_stamp.as_deref().unwrap_or("").trim().is_empty(),
+                ),
+                None => (false, false),
+            }
+        };
+        if !has_active {
+            continue;
+        }
+        let (is_active, app_opt) = sample_user_activity();
+        let net_opt = if needs_net {
+            Some(capture_network_stamp())
+        } else {
+            None
+        };
+
+        let mut state = lock_or_recover(&ojt_state);
+        if let Some(ref mut shift) = state.active_shift {
+            if is_active {
+                shift.active_minutes += 1;
+                if let Some(app) = app_opt {
+                    *shift.app_minutes.entry(app).or_insert(0) += 1;
+                }
+            } else {
+                shift.idle_minutes += 1;
+            }
+            if let Some(net) = net_opt {
+                if shift.network_stamp.as_deref().unwrap_or("").trim().is_empty() {
+                    shift.network_stamp = Some(net);
+                }
+            }
+            save_ojt_state(&state);
+        }
+    });
 }
 
 fn format_shift_summary_markdown(
@@ -4089,11 +4572,24 @@ fn format_shift_summary_markdown(
     time_in: &str,
     time_out: &str,
     duration_hours: f64,
+    active_minutes: u32,
+    idle_minutes: u32,
+    focus_percent: f32,
+    network_stamp: &str,
+    verification_hash: &str,
     activities: &[String],
 ) -> String {
     let mut md = format!(
-        "### OJT Shift Summary — {}\n- **Time In:** {} | **Time Out:** {} | **Rendered:** {:.2} hrs\n\n**Accomplishments:**\n",
-        date_str, time_in, time_out, duration_hours
+        "### OJT Shift Summary — {}\n- **Shift:** {} – {} | **Rendered:** {:.2} hrs\n- **Verified Focus:** {:.1}% ({}m active / {}m idle) | **Network:** {}\n- **Verification ID:** `{}`\n\n**Accomplishments:**\n",
+        date_str,
+        time_in,
+        time_out,
+        duration_hours,
+        focus_percent,
+        active_minutes,
+        idle_minutes,
+        network_stamp,
+        verification_hash
     );
     if activities.is_empty() {
         md.push_str("- General OJT engineering & development work\n");
@@ -4122,18 +4618,22 @@ fn scan_today_activity(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
         state.watched_repos.clone()
     };
 
-    let discovered = scan_git_and_agent_activities(&repos);
+    let (discovered, discovered_commits) = scan_git_and_agent_activities(&repos);
 
     let mut state = lock_or_recover(&ojt);
     reconcile_ojt_day(&mut state, &today);
     for item in &discovered {
         push_unique_activity(&mut state.today_activities, item.clone());
     }
+    merge_commit_evidence(&mut state.today_commits, &discovered_commits);
+
     let copy = state.today_activities.clone();
+    let commits_copy = state.today_commits.clone();
     if let Some(ref mut shift) = state.active_shift {
         for item in copy {
             push_unique_activity(&mut shift.notes, item);
         }
+        merge_commit_evidence(&mut shift.commit_evidence, &commits_copy);
     }
     save_ojt_state(&state);
     build_ojt_dashboard(&state)
@@ -4156,6 +4656,28 @@ fn add_manual_activity(bullet: String, ojt: State<'_, SharedOjtState>) -> OjtDas
 }
 
 #[tauri::command]
+fn update_today_reflections(
+    challenges: String,
+    learnings: String,
+    ojt: State<'_, SharedOjtState>,
+) -> OjtDashboardResponse {
+    let today = format_date(current_local_clock());
+    let clean_challenges = challenges.trim().to_string();
+    let clean_learnings = learnings.trim().to_string();
+
+    let mut state = lock_or_recover(&ojt);
+    reconcile_ojt_day(&mut state, &today);
+    state.today_challenges = clean_challenges.clone();
+    state.today_learnings = clean_learnings.clone();
+    if let Some(ref mut shift) = state.active_shift {
+        shift.challenges = clean_challenges;
+        shift.learnings = clean_learnings;
+    }
+    save_ojt_state(&state);
+    build_ojt_dashboard(&state)
+}
+
+#[tauri::command]
 fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
     let clock = current_local_clock();
     let today = format_date(clock);
@@ -4168,7 +4690,8 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
     };
 
     if let Some(shift) = active_opt {
-        let discovered = scan_git_and_agent_activities(&repos);
+        let (discovered, discovered_commits) = scan_git_and_agent_activities(&repos);
+        let net_out = capture_network_stamp();
 
         let mut state = lock_or_recover(&ojt);
         reconcile_ojt_day(&mut state, &today);
@@ -4176,6 +4699,8 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
         for item in discovered {
             push_unique_activity(&mut state.today_activities, item);
         }
+        merge_commit_evidence(&mut state.today_commits, &discovered_commits);
+
         let mut activities: Vec<String> = Vec::new();
         for item in &state.today_activities {
             push_unique_activity(&mut activities, item.clone());
@@ -4187,13 +4712,58 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             activities.push("General OJT engineering & development work".to_string());
         }
 
+        let mut commit_evidence = shift.commit_evidence.clone();
+        merge_commit_evidence(&mut commit_evidence, &state.today_commits);
+
+        let challenges = if !state.today_challenges.trim().is_empty() {
+            state.today_challenges.trim().to_string()
+        } else {
+            shift.challenges.trim().to_string()
+        };
+        let learnings = if !state.today_learnings.trim().is_empty() {
+            state.today_learnings.trim().to_string()
+        } else {
+            shift.learnings.trim().to_string()
+        };
+
         let elapsed = clock.unix_secs.saturating_sub(shift.start_ts) as f64;
         let duration_hours = round_two_decimals(elapsed / 3600.0).max(0.01);
+
+        let total_tracked = shift.active_minutes + shift.idle_minutes;
+        let focus_percent = if total_tracked > 0 {
+            ((shift.active_minutes as f32 / total_tracked as f32) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+        let commit_hashes = commit_evidence
+            .iter()
+            .map(|c| c.hash.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let verification_hash = compute_verification_hash(
+            &shift.date_str,
+            &shift.time_in_str,
+            &hm,
+            duration_hours,
+            &commit_hashes,
+            shift.active_minutes,
+        );
+        let net_in = shift
+            .network_stamp
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| net_out.clone());
+
         let summary_markdown = format_shift_summary_markdown(
             &shift.date_str,
             &shift.time_in_str,
             &hm,
             duration_hours,
+            shift.active_minutes,
+            shift.idle_minutes,
+            focus_percent,
+            &net_in,
+            &verification_hash,
             &activities,
         );
 
@@ -4205,12 +4775,23 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             duration_hours,
             activities,
             summary_markdown,
+            active_minutes: shift.active_minutes,
+            idle_minutes: shift.idle_minutes,
+            focus_percent,
+            network_stamp_in: Some(net_in),
+            network_stamp_out: Some(net_out),
+            app_breakdown: shift.app_minutes,
+            commit_evidence,
+            challenges,
+            learnings,
+            verification_hash,
         };
         state.completed_shifts.insert(0, completed);
         state.active_shift = None;
         save_ojt_state(&state);
         build_ojt_dashboard(&state)
     } else {
+        let net_in = capture_network_stamp();
         let mut state = lock_or_recover(&ojt);
         reconcile_ojt_day(&mut state, &today);
         state.active_shift = Some(ShiftSession {
@@ -4218,6 +4799,13 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             date_str: today,
             time_in_str: hm,
             notes: state.today_activities.clone(),
+            active_minutes: 0,
+            idle_minutes: 0,
+            network_stamp: Some(net_in),
+            app_minutes: HashMap::new(),
+            commit_evidence: state.today_commits.clone(),
+            challenges: state.today_challenges.clone(),
+            learnings: state.today_learnings.clone(),
         });
         save_ojt_state(&state);
         build_ojt_dashboard(&state)
@@ -4257,98 +4845,528 @@ fn update_ojt_settings(
     build_ojt_dashboard(&state)
 }
 
+fn format_tools_summary(app_map: &HashMap<String, u32>) -> String {
+    let top = top_apps_sorted(app_map, 4);
+    if top.is_empty() {
+        "_None sampled yet_".to_string()
+    } else {
+        top.into_iter()
+            .map(|(name, mins)| format!("{} ({}m)", name, mins))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn build_daily_markdown(today: &str, dash: &OjtDashboardResponse) -> String {
+    let mut today_shifts: Vec<&CompletedShift> = dash
+        .completed_shifts
+        .iter()
+        .filter(|s| s.date_str == today)
+        .collect();
+    today_shifts.sort_by(|a, b| a.time_in.cmp(&b.time_in));
+
+    let mut active_m: u32 = today_shifts.iter().map(|s| s.active_minutes).sum();
+    let mut idle_m: u32 = today_shifts.iter().map(|s| s.idle_minutes).sum();
+    let mut app_totals: HashMap<String, u32> = HashMap::new();
+    for s in &today_shifts {
+        for (app, mins) in &s.app_breakdown {
+            *app_totals.entry(app.clone()).or_insert(0) += *mins;
+        }
+    }
+
+    let mut rendered_today: f64 = today_shifts.iter().map(|s| s.duration_hours).sum();
+    if let Some(ref active) = dash.active_shift {
+        if active.date_str == today {
+            active_m += active.active_minutes;
+            idle_m += active.idle_minutes;
+            for (app, mins) in &active.app_minutes {
+                *app_totals.entry(app.clone()).or_insert(0) += *mins;
+            }
+            let elapsed_hrs =
+                round_two_decimals(now_secs().saturating_sub(active.start_ts) as f64 / 3600.0);
+            rendered_today = round_two_decimals(rendered_today + elapsed_hrs);
+        }
+    }
+
+    let shift_window = match (today_shifts.first(), today_shifts.last(), &dash.active_shift) {
+        (Some(first), Some(_), Some(active)) if active.date_str == today => {
+            format!("{} – Active ({}+)", first.time_in, active.time_in_str)
+        }
+        (Some(first), Some(last), _) => format!("{} – {}", first.time_in, last.time_out),
+        (None, None, Some(active)) => format!("{} – In Progress", active.time_in_str),
+        _ => "No shift clocked today".to_string(),
+    };
+
+    let total_tracked = active_m + idle_m;
+    let focus_pct = if total_tracked > 0 {
+        ((active_m as f32 / total_tracked as f32) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+    let tools_summary = format_tools_summary(&app_totals);
+
+    let net_stamp = today_shifts
+        .first()
+        .and_then(|s| s.network_stamp_in.as_ref())
+        .cloned()
+        .unwrap_or_else(|| dash.current_network_stamp.clone());
+
+    let mut commits = dash.today_commits.clone();
+    for s in &today_shifts {
+        merge_commit_evidence(&mut commits, &s.commit_evidence);
+    }
+
+    let verification_id = if !today_shifts.is_empty() {
+        today_shifts
+            .iter()
+            .map(|s| {
+                if s.verification_hash.is_empty() {
+                    compute_verification_hash(
+                        &s.date_str,
+                        &s.time_in,
+                        &s.time_out,
+                        s.duration_hours,
+                        "",
+                        s.active_minutes,
+                    )
+                } else {
+                    s.verification_hash.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else if let Some(ref active) = dash.active_shift {
+        let hashes = commits
+            .iter()
+            .map(|c| c.hash.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{} (Live Preview)",
+            compute_verification_hash(
+                &active.date_str,
+                &active.time_in_str,
+                "LIVE",
+                rendered_today,
+                &hashes,
+                active.active_minutes,
+            )
+        )
+    } else {
+        "Pending Shift Completion".to_string()
+    };
+
+    let mut activities = dash.today_activities.clone();
+    for s in &today_shifts {
+        for a in &s.activities {
+            push_unique_activity(&mut activities, a.clone());
+        }
+    }
+
+    let challenges = if !dash.today_challenges.trim().is_empty() {
+        dash.today_challenges.trim().to_string()
+    } else {
+        today_shifts
+            .iter()
+            .map(|s| s.challenges.trim())
+            .find(|c| !c.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let learnings = if !dash.today_learnings.trim().is_empty() {
+        dash.today_learnings.trim().to_string()
+    } else {
+        today_shifts
+            .iter()
+            .map(|s| s.learnings.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let dow = day_of_week_name(today);
+    let date_header = if dow.is_empty() {
+        today.to_string()
+    } else {
+        format!("{} ({})", today, dow)
+    };
+
+    let mut md = String::new();
+    md.push_str(&format!("# OJT Daily Accomplishment Record — {}\n\n", today));
+    md.push_str(&format!("- **Date:** {}\n", date_header));
+    md.push_str(&format!("- **Shift Window:** {}\n", shift_window));
+    md.push_str(&format!(
+        "- **Net Rendered Hours:** {:.2} hrs (Cumulative: {:.2} / {:.1} hrs · {:.1}% · Est. Completion: {})\n",
+        rendered_today,
+        dash.rendered_hours,
+        dash.target_hours,
+        dash.progress_percent,
+        dash.estimated_completion_date
+    ));
+    md.push_str(&format!(
+        "- **Active Focus Ratio:** {:.1}% Active ({}m active / {}m idle) | **Top Tools:** {}\n",
+        focus_pct, active_m, idle_m, tools_summary
+    ));
+    md.push_str(&format!("- **Network / Workstation Stamp:** {}\n", net_stamp));
+    md.push_str(&format!("- **Shift Verification ID:** `{}`\n\n", verification_id));
+
+    md.push_str("## Verified Git Commit & File Evidence\n\n");
+    if commits.is_empty() {
+        md.push_str("_No git commits captured for this date._\n\n");
+    } else {
+        md.push_str("| Time | Repo | Hash | File Changes | Commit Message |\n");
+        md.push_str("| --- | --- | --- | --- | --- |\n");
+        for c in &commits {
+            let stats = if c.files_changed > 0 {
+                format!("{} file(s), +{} / -{}", c.files_changed, c.insertions, c.deletions)
+            } else {
+                "-".to_string()
+            };
+            let msg = c.message.replace('|', "/").replace(['\r', '\n'], " ");
+            md.push_str(&format!(
+                "| {} | {} | `{}` | {} | {} |\n",
+                c.timestamp, c.repo, c.hash, stats, msg
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Accomplishments\n\n");
+    if activities.is_empty() {
+        md.push_str("_No accomplishments logged for today yet._\n\n");
+    } else {
+        for item in &activities {
+            md.push_str(&format!("- {}\n", item));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Problems Encountered\n\n");
+    if challenges.is_empty() {
+        md.push_str("_None logged for today._\n\n");
+    } else {
+        md.push_str(&format!("{}\n\n", challenges));
+    }
+
+    md.push_str("## Solutions & Key Learnings\n\n");
+    if learnings.is_empty() {
+        md.push_str("_None logged for today._\n");
+    } else {
+        md.push_str(&format!("{}\n", learnings));
+    }
+
+    md
+}
+
+fn build_weekly_journal_markdown(
+    today: &str,
+    scope: &str,
+    dash: &OjtDashboardResponse,
+) -> String {
+    let (iso_year, iso_week) = iso_week_number(today);
+    let mut shifts: Vec<&CompletedShift> = if scope == "weekly" {
+        dash.completed_shifts.iter().take(7).collect()
+    } else {
+        dash.completed_shifts.iter().collect()
+    };
+    shifts.sort_by(|a, b| a.date_str.cmp(&b.date_str).then_with(|| a.time_in.cmp(&b.time_in)));
+
+    let title = if scope == "weekly" {
+        format!("# OJT Weekly Accomplishment Journal — {}-W{:02}", iso_year, iso_week)
+    } else {
+        "# Complete OJT DTR & Accomplishment Journal".to_string()
+    };
+
+    let period_hours: f64 = round_two_decimals(shifts.iter().map(|s| s.duration_hours).sum());
+    let mut md = String::new();
+    md.push_str(&format!("{}\n\n", title));
+    md.push_str(&format!(
+        "**Generated:** {} | **Period Hours:** {:.2} hrs | **Cumulative Progress:** {:.2} / {:.1} hrs ({:.1}%) | **Remaining:** {:.2} hrs ({} shifts est. → {})\n\n",
+        today,
+        period_hours,
+        dash.rendered_hours,
+        dash.target_hours,
+        dash.progress_percent,
+        dash.remaining_hours,
+        dash.shifts_remaining,
+        dash.estimated_completion_date
+    ));
+
+    md.push_str("## 1. Weekly DTR Attendance Table\n\n");
+    md.push_str("| Date | Time In | Time Out | Active Ratio | Hours | Verification ID |\n");
+    md.push_str("| --- | --- | --- | ---: | ---: | --- |\n");
+    if shifts.is_empty() {
+        md.push_str("| - | - | - | - | 0.00 | No completed shifts in selected period |\n");
+    } else {
+        for s in &shifts {
+            let ratio_str = if s.active_minutes + s.idle_minutes > 0 {
+                format!("{:.1}% ({}m/{}m)", s.focus_percent, s.active_minutes, s.active_minutes + s.idle_minutes)
+            } else {
+                "-".to_string()
+            };
+            let ver_id = if s.verification_hash.is_empty() {
+                compute_verification_hash(
+                    &s.date_str,
+                    &s.time_in,
+                    &s.time_out,
+                    s.duration_hours,
+                    "",
+                    s.active_minutes,
+                )
+            } else {
+                s.verification_hash.clone()
+            };
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {:.2} | `{}` |\n",
+                s.date_str, s.time_in, s.time_out, ratio_str, s.duration_hours, ver_id
+            ));
+        }
+    }
+    md.push_str(&format!(
+        "\n- **Total Period Hours:** {:.2} hrs\n- **Cumulative OJT Hours:** {:.2} / {:.1} hrs ({:.1}%)\n\n",
+        period_hours, dash.rendered_hours, dash.target_hours, dash.progress_percent
+    ));
+
+    #[derive(Default)]
+    struct DayBucket {
+        windows: Vec<String>,
+        net_stamps: Vec<String>,
+        ver_ids: Vec<String>,
+        active_m: u32,
+        idle_m: u32,
+        commits: Vec<GitCommitEvidence>,
+        activities: Vec<String>,
+        challenges: Vec<String>,
+        learnings: Vec<String>,
+    }
+
+    let mut days: std::collections::BTreeMap<String, DayBucket> = std::collections::BTreeMap::new();
+    let mut period_app_totals: HashMap<String, u32> = HashMap::new();
+    let mut unique_repos: HashSet<String> = HashSet::new();
+    let mut total_commits_logged = 0usize;
+
+    for s in &shifts {
+        let entry = days.entry(s.date_str.clone()).or_default();
+        entry
+            .windows
+            .push(format!("{}–{} ({:.2}h)", s.time_in, s.time_out, s.duration_hours));
+        if let Some(ref net) = s.network_stamp_in {
+            push_unique_activity(&mut entry.net_stamps, net.clone());
+        }
+        if !s.verification_hash.trim().is_empty() {
+            push_unique_activity(&mut entry.ver_ids, s.verification_hash.clone());
+        }
+        entry.active_m += s.active_minutes;
+        entry.idle_m += s.idle_minutes;
+        for (app, mins) in &s.app_breakdown {
+            *period_app_totals.entry(app.clone()).or_insert(0) += *mins;
+        }
+        merge_commit_evidence(&mut entry.commits, &s.commit_evidence);
+        for act in &s.activities {
+            push_unique_activity(&mut entry.activities, act.clone());
+        }
+        if !s.challenges.trim().is_empty() {
+            push_unique_activity(&mut entry.challenges, s.challenges.trim().to_string());
+        }
+        if !s.learnings.trim().is_empty() {
+            push_unique_activity(&mut entry.learnings, s.learnings.trim().to_string());
+        }
+    }
+
+    if dash.active_shift.is_some()
+        || !dash.today_activities.is_empty()
+        || !dash.today_commits.is_empty()
+        || !dash.today_challenges.trim().is_empty()
+        || !dash.today_learnings.trim().is_empty()
+    {
+        let entry = days.entry(today.to_string()).or_default();
+        if let Some(ref active) = dash.active_shift {
+            entry
+                .windows
+                .push(format!("{}–Active", active.time_in_str));
+            if let Some(ref net) = active.network_stamp {
+                push_unique_activity(&mut entry.net_stamps, net.clone());
+            }
+            entry.active_m += active.active_minutes;
+            entry.idle_m += active.idle_minutes;
+            for (app, mins) in &active.app_minutes {
+                *period_app_totals.entry(app.clone()).or_insert(0) += *mins;
+            }
+        }
+        merge_commit_evidence(&mut entry.commits, &dash.today_commits);
+        for act in &dash.today_activities {
+            push_unique_activity(&mut entry.activities, act.clone());
+        }
+        if !dash.today_challenges.trim().is_empty() {
+            push_unique_activity(&mut entry.challenges, dash.today_challenges.trim().to_string());
+        }
+        if !dash.today_learnings.trim().is_empty() {
+            push_unique_activity(&mut entry.learnings, dash.today_learnings.trim().to_string());
+        }
+    }
+
+    md.push_str("## 2. Day-by-Day Technical Accomplishment Breakdown\n\n");
+    if days.is_empty() {
+        md.push_str("_No daily activity recorded in selected period yet._\n\n");
+    } else {
+        for (date, bucket) in &days {
+            let dow = day_of_week_name(date);
+            let label = if dow.is_empty() {
+                date.clone()
+            } else {
+                format!("{} ({})", date, dow)
+            };
+            md.push_str(&format!("### {}\n", label));
+            let win_str = if bucket.windows.is_empty() {
+                "Activity Log Only".to_string()
+            } else {
+                bucket.windows.join(", ")
+            };
+            let net_str = if bucket.net_stamps.is_empty() {
+                dash.current_network_stamp.clone()
+            } else {
+                bucket.net_stamps.join(", ")
+            };
+            let day_total = bucket.active_m + bucket.idle_m;
+            let day_focus = if day_total > 0 {
+                format!(
+                    "{:.1}% active ({}m active / {}m idle)",
+                    (bucket.active_m as f32 / day_total as f32) * 100.0,
+                    bucket.active_m,
+                    bucket.idle_m
+                )
+            } else {
+                "No heartbeat data".to_string()
+            };
+            md.push_str(&format!(
+                "- **Shift & Telemetry:** {} | **Focus:** {} | **Network:** {}\n",
+                win_str, day_focus, net_str
+            ));
+            if !bucket.ver_ids.is_empty() {
+                md.push_str(&format!(
+                    "- **Verification ID(s):** `{}`\n",
+                    bucket.ver_ids.join("`, `")
+                ));
+            }
+            if !bucket.commits.is_empty() {
+                total_commits_logged += bucket.commits.len();
+                md.push_str("- **Git Commit Evidence:**\n");
+                for c in &bucket.commits {
+                    unique_repos.insert(c.repo.clone());
+                    let stat = if c.files_changed > 0 {
+                        format!(" · {}f +{} / -{}", c.files_changed, c.insertions, c.deletions)
+                    } else {
+                        String::new()
+                    };
+                    md.push_str(&format!(
+                        "  - `{}` ({} @ {}{}): {}\n",
+                        c.hash, c.repo, c.timestamp, stat, c.message
+                    ));
+                }
+            }
+            if !bucket.activities.is_empty() {
+                md.push_str("- **Tasks & Engineering Work:**\n");
+                for act in &bucket.activities {
+                    md.push_str(&format!("  - {}\n", act));
+                }
+            }
+            md.push('\n');
+        }
+    }
+
+    md.push_str("## 3. Consolidated Problems Encountered & Technical Solutions Applied\n\n");
+    let mut any_reflections = false;
+    for (date, bucket) in &days {
+        if !bucket.challenges.is_empty() || !bucket.learnings.is_empty() {
+            any_reflections = true;
+            md.push_str(&format!("### {}\n", date));
+            if !bucket.challenges.is_empty() {
+                md.push_str(&format!(
+                    "- **Problems Encountered:** {}\n",
+                    bucket.challenges.join("; ")
+                ));
+            }
+            if !bucket.learnings.is_empty() {
+                md.push_str(&format!(
+                    "- **Solutions & Key Learnings:** {}\n",
+                    bucket.learnings.join("; ")
+                ));
+            }
+            md.push('\n');
+        }
+    }
+    if !any_reflections {
+        md.push_str(
+            "_No daily challenges or solutions logged yet. Use the OJT Pulse reflections box during shifts to auto-populate this section._\n\n",
+        );
+    }
+
+    let total_active: u32 = days.values().map(|b| b.active_m).sum();
+    let total_tracked: u32 = days.values().map(|b| b.active_m + b.idle_m).sum();
+    let avg_focus = if total_tracked > 0 {
+        (total_active as f32 / total_tracked as f32) * 100.0
+    } else {
+        0.0
+    };
+    let tools_summary = format_tools_summary(&period_app_totals);
+
+    md.push_str("## 4. Weekly Learning Synthesis & Coordinator Verification\n\n");
+    md.push_str(&format!(
+        "- **Average Verified Active Focus:** {:.1}% ({}m active / {}m total tracked)\n",
+        avg_focus, total_active, total_tracked
+    ));
+    md.push_str(&format!("- **Primary Development Tools:** {}\n", tools_summary));
+    md.push_str(&format!(
+        "- **Verified Commit Artifacts:** {} commit(s) across {} repository(ies)\n",
+        total_commits_logged,
+        unique_repos.len()
+    ));
+    md.push_str(
+        "- **Audit Integrity:** Each completed shift embeds an FNV-1a Verification ID (`OJT-...`) derived from date, clock-in/out timestamps, rendered duration, commit hashes, and verified active minutes.\n\n",
+    );
+    md.push_str("| Trainee Signature | Date | OJT Coordinator / Supervisor | Date |\n");
+    md.push_str("| --- | --- | --- | --- |\n");
+    md.push_str(&format!(
+        "| ________________________ | {} | ________________________ | ________ |\n",
+        today
+    ));
+
+    md
+}
+
 #[tauri::command]
 fn export_markdown_report(
     period: String,
     ojt: State<'_, SharedOjtState>,
 ) -> Result<String, String> {
     let today = format_date(current_local_clock());
-    let (dash, export_dir, completed_shifts) = {
+    let (dash, export_dir) = {
         let mut state = lock_or_recover(&ojt);
         reconcile_ojt_day(&mut state, &today);
         (
             build_ojt_dashboard(&state),
             state.obsidian_export_dir.clone(),
-            state.completed_shifts.clone(),
         )
     };
 
     let scope = period.trim().to_lowercase();
-    let scope_label = match scope.as_str() {
-        "daily" => "Daily Accomplishment Report",
-        "weekly" => "Weekly DTR & Accomplishment Summary",
-        _ => "Complete OJT DTR & Accomplishment Report",
+    let md = if scope == "daily" {
+        build_daily_markdown(&today, &dash)
+    } else {
+        build_weekly_journal_markdown(&today, &scope, &dash)
     };
-
-    let mut md = String::new();
-    md.push_str("# OJT Accomplishment & Daily Time Record (DTR)\n\n");
-    md.push_str(&format!("**Date:** {} | **Scope:** {}\n\n", today, scope_label));
-    md.push_str(&format!(
-        "- **Rendered Hours:** {:.2} / {:.1} hrs ({:.1}%)\n",
-        dash.rendered_hours, dash.target_hours, dash.progress_percent
-    ));
-    md.push_str(&format!(
-        "- **Remaining Hours:** {:.2} hrs ({} shifts est. @ 8h/day)\n",
-        dash.remaining_hours, dash.shifts_remaining
-    ));
-    md.push_str(&format!(
-        "- **Estimated Completion Date:** {}\n\n",
-        dash.estimated_completion_date
-    ));
-
-    md.push_str(&format!("## Today's Accomplishment Log ({})\n", today));
-    if dash.today_activities.is_empty() {
-        md.push_str("_No activities logged for today yet._\n\n");
-    } else {
-        for item in &dash.today_activities {
-            md.push_str(&format!("- {}\n", item));
-        }
-        md.push('\n');
-    }
-
-    let filtered_shifts: Vec<&CompletedShift> = if scope == "daily" {
-        completed_shifts
-            .iter()
-            .filter(|s| s.date_str == today)
-            .collect()
-    } else if scope == "weekly" {
-        completed_shifts.iter().take(7).collect()
-    } else {
-        completed_shifts.iter().collect()
-    };
-
-    md.push_str("## Daily Time Record (DTR)\n\n");
-    md.push_str("| Date | Time In | Time Out | Hours | Key Accomplishments |\n");
-    md.push_str("| --- | --- | --- | ---: | --- |\n");
-    if filtered_shifts.is_empty() {
-        md.push_str("| - | - | - | 0.00 | No completed shifts in selected period |\n");
-    } else {
-        for s in filtered_shifts {
-            let summary_cell = if s.activities.is_empty() {
-                "-".to_string()
-            } else {
-                s.activities
-                    .iter()
-                    .take(5)
-                    .map(|a| a.replace('|', "/").replace(['\r', '\n'], " "))
-                    .collect::<Vec<String>>()
-                    .join("; ")
-            };
-            md.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} |\n",
-                s.date_str, s.time_in, s.time_out, s.duration_hours, summary_cell
-            ));
-        }
-    }
 
     if let Some(dir) = export_dir {
         let dir_path = Path::new(&dir);
         fs::create_dir_all(dir_path)
             .map_err(|e| format!("Failed to create Obsidian export folder '{}': {}", dir, e))?;
-        let filename = if scope == "all" {
-            "OJT-DTR-Complete.md".to_string()
+        let filename = if scope == "daily" {
+            format!("OJT-Daily-{}.md", today)
+        } else if scope == "weekly" {
+            let (_y, w) = iso_week_number(&today);
+            format!("OJT-Weekly-Journal-W{:02}.md", w)
         } else {
-            format!("OJT-Log-{}.md", today)
+            "OJT-DTR-Complete.md".to_string()
         };
         let target_file = dir_path.join(filename);
         fs::write(&target_file, &md)
@@ -4392,6 +5410,7 @@ pub fn run() {
             let paused = app.state::<PausedSessions>().inner().clone();
             let resumed = app.state::<ResumedSessions>().inner().clone();
             let cache = app.state::<AutoDiscoveredCache>().inner().clone();
+            let ojt = app.state::<SharedOjtState>().inner().clone();
 
             spawn_telemetry_server(
                 handle.clone(),
@@ -4406,6 +5425,7 @@ pub fn run() {
             spawn_auto_discovery_watcher(
                 handle, shared, manual, dismissed, approved, paused, resumed, cache,
             );
+            spawn_ojt_pow_watcher(ojt);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4424,6 +5444,7 @@ pub fn run() {
             update_ojt_settings,
             scan_today_activity,
             add_manual_activity,
+            update_today_reflections,
             export_markdown_report
         ])
         .run(tauri::generate_context!())

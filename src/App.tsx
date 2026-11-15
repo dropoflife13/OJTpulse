@@ -29,6 +29,10 @@ import {
   ListChecks,
   Save,
   Pause,
+  ShieldCheck,
+  Wifi,
+  GitCommitHorizontal,
+  BookOpen,
 } from "lucide-react";
 import "./App.css";
 
@@ -38,11 +42,28 @@ type ActiveTab = "agents" | "reaper" | "ojt";
 type AgentFilter = "active" | "paused" | "done" | "all";
 type OjtSubTab = "today" | "history" | "settings";
 
+interface GitCommitEvidence {
+  hash: string;
+  timestamp: string;
+  repo: string;
+  message: string;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+}
+
 interface ShiftSession {
   start_ts: number;
   date_str: string;
   time_in_str: string;
   notes: string[];
+  active_minutes: number;
+  idle_minutes: number;
+  network_stamp?: string | null;
+  app_minutes: Record<string, number>;
+  commit_evidence: GitCommitEvidence[];
+  challenges: string;
+  learnings: string;
 }
 
 interface CompletedShift {
@@ -53,6 +74,16 @@ interface CompletedShift {
   duration_hours: number;
   activities: string[];
   summary_markdown: string;
+  active_minutes: number;
+  idle_minutes: number;
+  focus_percent: number;
+  network_stamp_in?: string | null;
+  network_stamp_out?: string | null;
+  app_breakdown: Record<string, number>;
+  commit_evidence: GitCommitEvidence[];
+  challenges: string;
+  learnings: string;
+  verification_hash: string;
 }
 
 interface OjtDashboardResponse {
@@ -67,6 +98,12 @@ interface OjtDashboardResponse {
   active_shift?: ShiftSession | null;
   completed_shifts: CompletedShift[];
   today_activities: string[];
+  today_commits: GitCommitEvidence[];
+  today_challenges: string;
+  today_learnings: string;
+  current_focus_percent: number;
+  top_active_apps: [string, number][];
+  current_network_stamp: string;
 }
 
 function formatElapsedHms(totalSecs: number): string {
@@ -481,6 +518,9 @@ export default function App() {
   const [ojt, setOjt] = useState<OjtDashboardResponse | null>(null);
   const [ojtSubTab, setOjtSubTab] = useState<OjtSubTab>("today");
   const [manualNote, setManualNote] = useState("");
+  const [challengesInput, setChallengesInput] = useState("");
+  const [learningsInput, setLearningsInput] = useState("");
+  const [isSavingReflections, setIsSavingReflections] = useState(false);
   const [ojtBanner, setOjtBanner] = useState<string | null>(null);
   const [isSyncingOjt, setIsSyncingOjt] = useState(false);
   const [shiftElapsedSecs, setShiftElapsedSecs] = useState(0);
@@ -502,6 +542,8 @@ export default function App() {
       setTargetHoursInput(String(res.target_hours));
       setReposInput(res.watched_repos.join("\n"));
       setExportDirInput(res.obsidian_export_dir ?? "");
+      setChallengesInput(res.today_challenges ?? "");
+      setLearningsInput(res.today_learnings ?? "");
     }
   };
 
@@ -555,6 +597,7 @@ export default function App() {
     fetchHealth();
     fetchOjtState(true);
     const healthInterval = setInterval(fetchHealth, 4000);
+    const ojtInterval = setInterval(() => fetchOjtState(false), 30000);
 
     const unlistenPromise = listen<AgentSession[]>(
       "dinobuds-update",
@@ -600,6 +643,7 @@ export default function App() {
 
     return () => {
       clearInterval(healthInterval);
+      clearInterval(ojtInterval);
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
@@ -780,16 +824,39 @@ export default function App() {
     }
   };
 
+  const handleSaveReflections = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSavingReflections(true);
+    try {
+      const res = await invoke<OjtDashboardResponse>("update_today_reflections", {
+        challenges: challengesInput,
+        learnings: learningsInput,
+      });
+      applyOjtResponse(res, true);
+      showOjtBanner("Saved daily challenges & key learnings!");
+    } catch (err) {
+      showOjtBanner(`Failed to save reflections: ${String(err)}`);
+    } finally {
+      setIsSavingReflections(false);
+    }
+  };
+
   const handleExportMarkdown = async (period: "daily" | "weekly" | "all") => {
     try {
       const md = await invoke<string>("export_markdown_report", { period });
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(md);
       }
+      const label =
+        period === "daily"
+          ? "Daily Record"
+          : period === "weekly"
+            ? "Weekly Journal"
+            : "Complete DTR";
       showOjtBanner(
         ojt?.obsidian_export_dir
-          ? "Exported Markdown to Obsidian folder & copied to clipboard!"
-          : "Copied formal OJT Markdown report to clipboard!"
+          ? `Saved ${label} (.md) to Obsidian folder & copied!`
+          : `Copied formal ${label} (.md) to clipboard!`
       );
     } catch (err) {
       showOjtBanner(`Export failed: ${String(err)}`);
@@ -1587,6 +1654,55 @@ export default function App() {
               )}
             </button>
 
+            {/* Live Proof-of-Work Telemetry Strip */}
+            <div className="rounded-lg p-1.5 bg-zinc-950/80 border border-zinc-800/80 space-y-1">
+              <div className="flex flex-wrap items-center gap-1 text-[9.5px] font-mono">
+                <span
+                  title="Active input heartbeats sampled every 60s during shift"
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border ${
+                    (ojt?.current_focus_percent ?? 0) >= 70
+                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                      : "bg-amber-500/10 text-amber-200 border-amber-500/25"
+                  }`}
+                >
+                  <ShieldCheck className="w-2.5 h-2.5" />
+                  Verified Active:{" "}
+                  {ojt?.active_shift
+                    ? ojt.active_shift.active_minutes
+                    : ojt?.completed_shifts[0]?.active_minutes ?? 0}
+                  m ({(ojt?.current_focus_percent ?? 0).toFixed(0)}%)
+                </span>
+
+                <span
+                  title="Network / Workstation stamp captured for DTR audit"
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-800/90 text-zinc-300 border border-zinc-700/70 truncate max-w-[140px]"
+                >
+                  <Wifi className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                  <span className="truncate">
+                    {ojt?.current_network_stamp ?? "Workstation"}
+                  </span>
+                </span>
+
+                <span
+                  title="Git commits and logged tasks captured today"
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-800/90 text-zinc-300 border border-zinc-700/70"
+                >
+                  <GitCommitHorizontal className="w-2.5 h-2.5 text-violet-400" />
+                  {ojt?.today_commits.length ?? 0}c &bull;{" "}
+                  {ojt?.today_activities.length ?? 0} tasks
+                </span>
+              </div>
+
+              {ojt && ojt.top_active_apps.length > 0 && (
+                <div className="text-[9.5px] text-zinc-400 truncate px-0.5 font-mono">
+                  Tools:{" "}
+                  {ojt.top_active_apps
+                    .map(([app, mins]) => `${app} (${mins}m)`)
+                    .join(" · ")}
+                </div>
+              )}
+            </div>
+
             {ojtBanner && (
               <div className="select-text px-2 py-1 rounded bg-emerald-500/15 border border-emerald-500/30 text-[10.5px] text-emerald-300">
                 {ojtBanner}
@@ -1633,28 +1749,70 @@ export default function App() {
           {/* Sub-view: Today's Log */}
           {ojtSubTab === "today" && (
             <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={handleScanActivity}
-                  disabled={isSyncingOjt}
-                  className="ui-chrome flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 border border-zinc-700/80 text-[11px] font-medium transition-colors cursor-pointer disabled:opacity-60"
-                >
-                  <RefreshCw
-                    className={`w-3 h-3 ${isSyncingOjt ? "animate-spin" : ""}`}
-                  />
-                  Sync Git &amp; Agent Tasks
-                </button>
+              <button
+                type="button"
+                onClick={handleScanActivity}
+                disabled={isSyncingOjt}
+                className="ui-chrome w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 border border-zinc-700/80 text-[11px] font-medium transition-colors cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`w-3 h-3 ${isSyncingOjt ? "animate-spin" : ""}`}
+                />
+                Sync Git Commits &amp; Agent Tasks
+              </button>
+
+              <div className="grid grid-cols-2 gap-1.5">
                 <button
                   type="button"
                   onClick={() => handleExportMarkdown("daily")}
-                  title="Generate formal daily journal Markdown & copy to clipboard"
-                  className="ui-chrome flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[11px] font-medium transition-colors cursor-pointer"
+                  title="Generate verifiable Daily Accomplishment Record & copy to clipboard"
+                  className="ui-chrome flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px] font-medium transition-colors cursor-pointer"
                 >
-                  <FileText className="w-3 h-3" />
-                  Copy Journal MD
+                  <FileText className="w-3 h-3 shrink-0" />
+                  <span className="truncate">Copy Daily Record (.md)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportMarkdown("weekly")}
+                  title="Compile formal Weekly OJT Journal & DTR table & copy to clipboard"
+                  className="ui-chrome flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[10px] font-medium transition-colors cursor-pointer"
+                >
+                  <BookOpen className="w-3 h-3 shrink-0" />
+                  <span className="truncate">Compile Weekly Journal (.md)</span>
                 </button>
               </div>
+
+              {/* Git Commit Evidence Badges */}
+              {ojt && ojt.today_commits.length > 0 && (
+                <div className="rounded-xl p-2 bg-zinc-900/70 border border-zinc-800/80 space-y-1">
+                  <div className="flex items-center gap-1 text-[9.5px] font-semibold uppercase tracking-wider text-zinc-400">
+                    <GitCommitHorizontal className="w-3 h-3 text-violet-400" />
+                    Git Commit Evidence ({ojt.today_commits.length})
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {ojt.today_commits.slice(0, 6).map((c) => (
+                      <span
+                        key={`${c.repo}-${c.hash}`}
+                        title={`${c.repo} @ ${c.timestamp}: ${c.message}`}
+                        className="select-text inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-[9.5px] font-mono text-zinc-300"
+                      >
+                        <span className="text-violet-300">{c.hash}</span>
+                        <span className="text-zinc-500">{c.repo}</span>
+                        {c.files_changed > 0 && (
+                          <span className="text-emerald-400">
+                            +{c.insertions}/-{c.deletions}
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                    {ojt.today_commits.length > 6 && (
+                      <span className="text-[9.5px] text-zinc-500 px-1 py-0.5">
+                        +{ojt.today_commits.length - 6} more
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <form onSubmit={handleAddManualActivity} className="flex items-center gap-1.5">
                 <input
@@ -1673,11 +1831,45 @@ export default function App() {
                 </button>
               </form>
 
+              {/* Daily Reflection Inputs */}
+              <form
+                onSubmit={handleSaveReflections}
+                className="rounded-xl p-2 bg-zinc-900/70 border border-zinc-800/80 space-y-1.5"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[9.5px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Daily Reflections (for Coordinator Journal)
+                  </span>
+                  <button
+                    type="submit"
+                    disabled={isSavingReflections}
+                    className="ui-chrome inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[9.5px] font-medium cursor-pointer disabled:opacity-60"
+                  >
+                    <Save className="w-2.5 h-2.5" />
+                    Save
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  value={challengesInput}
+                  onChange={(e) => setChallengesInput(e.target.value)}
+                  placeholder="Challenge / Blocker Solved..."
+                  className="w-full px-2 py-1 rounded-lg bg-zinc-950/90 border border-zinc-800 text-[10.5px] text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500/50"
+                />
+                <input
+                  type="text"
+                  value={learningsInput}
+                  onChange={(e) => setLearningsInput(e.target.value)}
+                  placeholder="Key Learning / Technical Solution..."
+                  className="w-full px-2 py-1 rounded-lg bg-zinc-950/90 border border-zinc-800 text-[10.5px] text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-amber-500/50"
+                />
+              </form>
+
               <div className="space-y-1.5">
                 {!ojt || ojt.today_activities.length === 0 ? (
                   <div className="rounded-xl p-4 text-center bg-zinc-900/40 border border-zinc-800/60 text-[11px] text-zinc-500">
                     No activity bullets captured today yet. Click{" "}
-                    <span className="text-zinc-300">Sync Git &amp; Agent Tasks</span>{" "}
+                    <span className="text-zinc-300">Sync Git Commits &amp; Agent Tasks</span>{" "}
                     or add a manual note above.
                   </div>
                 ) : (
@@ -1697,18 +1889,28 @@ export default function App() {
           {/* Sub-view: DTR History */}
           {ojtSubTab === "history" && (
             <div className="space-y-2">
-              <div className="flex items-center justify-between px-0.5">
+              <div className="flex items-center justify-between gap-1.5 px-0.5">
                 <span className="text-[10.5px] font-semibold uppercase tracking-wider text-zinc-400">
                   Logged Shifts ({ojt?.completed_shifts.length ?? 0})
                 </span>
-                <button
-                  type="button"
-                  onClick={() => handleExportMarkdown("all")}
-                  className="ui-chrome flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px] font-medium cursor-pointer"
-                >
-                  <Copy className="w-3 h-3" />
-                  Copy DTR Table (MD)
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => handleExportMarkdown("weekly")}
+                    className="ui-chrome flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[10px] font-medium cursor-pointer"
+                  >
+                    <BookOpen className="w-3 h-3" />
+                    Compile Weekly Journal (.md)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleExportMarkdown("all")}
+                    title="Copy complete DTR table & journal"
+                    className="ui-chrome flex items-center gap-1 px-1.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px] font-medium cursor-pointer"
+                  >
+                    <Copy className="w-3 h-3" />
+                  </button>
+                </div>
               </div>
 
               {!ojt || ojt.completed_shifts.length === 0 ? (
@@ -1749,6 +1951,34 @@ export default function App() {
                             <Copy className="w-3 h-3" />
                           </button>
                         </div>
+                      </div>
+
+                      {/* Proof-of-Work Verification Row */}
+                      <div className="flex flex-wrap items-center gap-1 text-[9.5px] font-mono">
+                        {shift.verification_hash && (
+                          <span
+                            title="Deterministic Verification ID"
+                            className="select-text inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-amber-300"
+                          >
+                            <ShieldCheck className="w-2.5 h-2.5 text-emerald-400" />
+                            {shift.verification_hash}
+                          </span>
+                        )}
+                        <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-zinc-800/80 border border-zinc-700/60 text-emerald-300">
+                          {shift.focus_percent.toFixed(0)}% Active ({shift.active_minutes}m)
+                        </span>
+                        {shift.network_stamp_in && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-800/80 border border-zinc-700/60 text-zinc-300 truncate max-w-[130px]">
+                            <Wifi className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                            <span className="truncate">{shift.network_stamp_in}</span>
+                          </span>
+                        )}
+                        {shift.commit_evidence.length > 0 && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-800/80 border border-zinc-700/60 text-violet-300">
+                            <GitCommitHorizontal className="w-2.5 h-2.5" />
+                            {shift.commit_evidence.length}c
+                          </span>
+                        )}
                       </div>
 
                       {shift.activities.length > 0 && (
