@@ -77,13 +77,40 @@ type DismissedSessions = Arc<Mutex<HashMap<String, u64>>>;
 struct AutoDiscoveredCache(Arc<Mutex<Vec<AgentSession>>>);
 #[derive(Clone, Default)]
 struct ApprovedPrompts(Arc<Mutex<HashMap<String, (u64, bool)>>>);
+#[derive(Clone, Default)]
+struct PausedSessions(Arc<Mutex<HashMap<String, u64>>>);
+#[derive(Clone, Default)]
+struct ResumedSessions(Arc<Mutex<HashMap<String, u64>>>);
+
+fn paused_ids_file_path() -> Option<PathBuf> {
+    get_user_profile_dir().map(|home| home.join(".dinobuds").join("paused-ids.json"))
+}
+
+fn load_paused_ids() -> HashMap<String, u64> {
+    paused_ids_file_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, u64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_paused_ids(map: &HashMap<String, u64>) {
+    if let Some(path) = paused_ids_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(map) {
+            let _ = fs::write(&path, json);
+        }
+    }
+}
 
 fn status_rank(status: &str) -> u8 {
     match status {
         "waiting_permission" => 0,
         "running" => 1,
-        "queued" => 2,
-        _ => 3,
+        "paused" => 2,
+        "queued" => 3,
+        _ => 4,
     }
 }
 
@@ -92,6 +119,8 @@ fn reconcile_and_emit(
     manual: &ManualSessions,
     dismissed: &DismissedSessions,
     approved_prompts: &ApprovedPrompts,
+    paused_sessions: &PausedSessions,
+    resumed_sessions: &ResumedSessions,
     auto_sessions: &[AgentSession],
     app: &AppHandle,
 ) -> Vec<AgentSession> {
@@ -108,6 +137,10 @@ fn reconcile_and_emit(
     {
         let mut dismissed_map = lock_or_recover(dismissed);
         let mut approved_map = lock_or_recover(&approved_prompts.0);
+        let mut paused_map = lock_or_recover(&paused_sessions.0);
+        let mut paused_dirty = false;
+        let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+
         for raw_session in auto_sessions {
             let mut session = raw_session.clone();
             if seen_ids.contains(&session.id) {
@@ -120,28 +153,70 @@ fn reconcile_and_emit(
                 dismissed_map.remove(&session.id);
             }
 
-            if let Some(&(action_ts, was_approved)) = approved_map.get(&session.id) {
-                if was_approved {
-                    if now.saturating_sub(action_ts) <= 4 && session.status == "waiting_permission" {
-                        session.status = "running".to_string();
+            if let Some(&paused_at) = paused_map.get(&session.id) {
+                if session.status == "done" {
+                    paused_map.remove(&session.id);
+                    paused_dirty = true;
+                } else if session.updated_at > paused_at + 10
+                    && now.saturating_sub(session.updated_at) <= 20
+                {
+                    paused_map.remove(&session.id);
+                    paused_dirty = true;
+                } else {
+                    session.status = "paused".to_string();
+                    session.question = None;
+                    session.decision = None;
+                    session.step_label = if session.total_steps > 0 {
+                        format!(
+                            "Paused at checkpoint ({}/{})",
+                            session.current_step, session.total_steps
+                        )
+                    } else {
+                        "Paused".to_string()
+                    };
+                }
+            } else if let Some(&resumed_at) = resumed_map.get(&session.id) {
+                if now.saturating_sub(resumed_at) <= 25 && session.status == "paused" {
+                    session.status = "running".to_string();
+                    session.question = None;
+                    session.step_label = "Resuming checkpoint...".to_string();
+                } else if now.saturating_sub(resumed_at) > 25 || session.status == "done" {
+                    resumed_map.remove(&session.id);
+                }
+            }
+
+            if session.status != "paused" {
+                if let Some(&(action_ts, was_approved)) = approved_map.get(&session.id) {
+                    if was_approved {
+                        if now.saturating_sub(action_ts) <= 4
+                            && session.status == "waiting_permission"
+                        {
+                            session.status = "running".to_string();
+                            session.question = None;
+                            session.decision = Some(true);
+                            session.step_label = "Submitted ⏎".to_string();
+                        } else if now.saturating_sub(action_ts) > 4 {
+                            approved_map.remove(&session.id);
+                        }
+                    } else if session.updated_at <= action_ts
+                        && session.status == "waiting_permission"
+                    {
+                        session.status = "done".to_string();
                         session.question = None;
-                        session.decision = Some(true);
-                        session.step_label = "Submitted ⏎".to_string();
-                    } else if now.saturating_sub(action_ts) > 4 {
+                        session.decision = Some(false);
+                        session.step_label = "Skipped".to_string();
+                    } else if session.updated_at > action_ts {
                         approved_map.remove(&session.id);
                     }
-                } else if session.updated_at <= action_ts && session.status == "waiting_permission" {
-                    session.status = "done".to_string();
-                    session.question = None;
-                    session.decision = Some(false);
-                    session.step_label = "Skipped".to_string();
-                } else if session.updated_at > action_ts {
-                    approved_map.remove(&session.id);
                 }
             }
 
             seen_ids.insert(session.id.clone());
             merged.push(session);
+        }
+
+        if paused_dirty {
+            save_paused_ids(&paused_map);
         }
     }
 
@@ -202,8 +277,15 @@ fn resolve_permission(
     approved: bool,
     state: State<'_, SharedSessions>,
     manual: State<'_, ManualSessions>,
+    paused_sessions: State<'_, PausedSessions>,
     app: AppHandle,
 ) -> Vec<AgentSession> {
+    {
+        let mut paused_map = lock_or_recover(&paused_sessions.0);
+        if paused_map.remove(&id).is_some() {
+            save_paused_ids(&paused_map);
+        }
+    }
     {
         let mut manual_map = lock_or_recover(&manual);
         if let Some(session) = manual_map.get_mut(&id) {
@@ -259,9 +341,16 @@ fn submit_agent_prompt(
     state: State<'_, SharedSessions>,
     manual: State<'_, ManualSessions>,
     approved_prompts: State<'_, ApprovedPrompts>,
+    paused_sessions: State<'_, PausedSessions>,
     app: AppHandle,
 ) -> Vec<AgentSession> {
     let action_ts = now_secs();
+    {
+        let mut paused_map = lock_or_recover(&paused_sessions.0);
+        if paused_map.remove(&id).is_some() {
+            save_paused_ids(&paused_map);
+        }
+    }
     {
         let mut approved_map = lock_or_recover(&approved_prompts.0);
         approved_map.insert(id.clone(), (action_ts, approved));
@@ -499,6 +588,8 @@ fn dismiss_session(
     manual: State<'_, ManualSessions>,
     dismissed: State<'_, DismissedSessions>,
     approved_prompts: State<'_, ApprovedPrompts>,
+    paused_sessions: State<'_, PausedSessions>,
+    resumed_sessions: State<'_, ResumedSessions>,
     auto_cache: State<'_, AutoDiscoveredCache>,
     app: AppHandle,
 ) -> Vec<AgentSession> {
@@ -510,12 +601,260 @@ fn dismiss_session(
         let mut manual_map = lock_or_recover(&manual);
         manual_map.remove(&id);
     }
+    {
+        let mut paused_map = lock_or_recover(&paused_sessions.0);
+        if paused_map.remove(&id).is_some() {
+            save_paused_ids(&paused_map);
+        }
+    }
+    {
+        let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+        resumed_map.remove(&id);
+    }
     let cached_auto = lock_or_recover(&auto_cache.0).clone();
     reconcile_and_emit(
         &state,
         &manual,
         &dismissed,
         &approved_prompts,
+        &paused_sessions,
+        &resumed_sessions,
+        &cached_auto,
+        &app,
+    )
+}
+
+fn resolve_axiom_workspace(workspace_hint: Option<&str>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(ws) = workspace_hint {
+        candidates.push(PathBuf::from(ws));
+    }
+    if let Some(home) = get_user_profile_dir() {
+        candidates.push(home.join("axiom"));
+    }
+    for cand in candidates {
+        if cand.join("src").join("eval").join("ablation-v3.ts").is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn extract_model_for_axiom_run(
+    workspace_hint: Option<&str>,
+    run_id: &str,
+    task_text: &str,
+) -> Option<String> {
+    let mut dirs_to_check: Vec<PathBuf> = Vec::new();
+    if let Some(ws) = workspace_hint {
+        dirs_to_check.push(PathBuf::from(ws));
+    }
+    if let Some(home) = get_user_profile_dir() {
+        dirs_to_check.push(home.join("axiom"));
+    }
+
+    for dir in dirs_to_check {
+        let run_dir = dir.join(".axiom-state").join("runs-v3").join(run_id);
+        for fname in ["checkpoint.json", "results.json"] {
+            let p = run_dir.join(fname);
+            if p.is_file() {
+                if let Ok(mut f) = File::open(&p) {
+                    let mut buf = vec![0u8; 16_384];
+                    if let Ok(n) = f.read(&mut buf) {
+                        buf.truncate(n);
+                        let head = String::from_utf8_lossy(&buf);
+                        if let Some(m) = extract_json_string_field(&head, "requestedModel")
+                            .or_else(|| extract_json_string_field(&head, "model"))
+                        {
+                            if !m.trim().is_empty() {
+                                return Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((prefix, _)) = task_text.split_once(" — ") {
+        let trimmed = prefix.trim();
+        if !trimmed.is_empty() && !trimmed.contains(' ') && !trimmed.eq_ignore_ascii_case("completed") {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+#[tauri::command]
+fn toggle_pause_session(
+    id: String,
+    state: State<'_, SharedSessions>,
+    manual: State<'_, ManualSessions>,
+    dismissed: State<'_, DismissedSessions>,
+    approved_prompts: State<'_, ApprovedPrompts>,
+    paused_sessions: State<'_, PausedSessions>,
+    resumed_sessions: State<'_, ResumedSessions>,
+    auto_cache: State<'_, AutoDiscoveredCache>,
+    app: AppHandle,
+) -> Vec<AgentSession> {
+    let now = now_secs();
+    let existing_session = {
+        let cur = lock_or_recover(&state);
+        cur.iter().find(|s| s.id == id).cloned()
+    }
+    .or_else(|| {
+        let cache = lock_or_recover(&auto_cache.0);
+        cache.iter().find(|s| s.id == id).cloned()
+    })
+    .or_else(|| lock_or_recover(&manual).get(&id).cloned());
+
+    let is_currently_paused = {
+        let paused_map = lock_or_recover(&paused_sessions.0);
+        paused_map.contains_key(&id)
+            || existing_session
+                .as_ref()
+                .map(|s| s.status == "paused")
+                .unwrap_or(false)
+    };
+
+    if is_currently_paused {
+        {
+            let mut paused_map = lock_or_recover(&paused_sessions.0);
+            if paused_map.remove(&id).is_some() {
+                save_paused_ids(&paused_map);
+            }
+        }
+        {
+            let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+            resumed_map.insert(id.clone(), now);
+        }
+        {
+            let mut manual_map = lock_or_recover(&manual);
+            if let Some(session) = manual_map.get_mut(&id) {
+                session.status = "running".to_string();
+                session.question = None;
+                session.step_label = "Resuming checkpoint...".to_string();
+                session.updated_at = now;
+            }
+        }
+
+        if id.starts_with("axiom-") {
+            if let Some(ref session) = existing_session {
+                let run_id = session.name.clone();
+                let ws_hint = session.workspace_path.as_deref();
+                let model_opt = extract_model_for_axiom_run(ws_hint, &run_id, &session.task);
+                let axiom_ws_opt = resolve_axiom_workspace(ws_hint);
+
+                #[cfg(target_os = "windows")]
+                if let (Some(model), Some(axiom_ws)) = (model_opt, axiom_ws_opt) {
+                    let ws_str = axiom_ws.to_string_lossy().to_string();
+                    std::thread::spawn(move || {
+                        let script = r#"
+$runId = $env:DINOBUDS_RUN_ID
+$model = $env:DINOBUDS_MODEL
+$ws = $env:DINOBUDS_WS
+if (-not $runId -or -not $model -or -not $ws) { exit 0 }
+$running = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object {
+    $_.CommandLine -and $_.CommandLine -like "*--run-id*$runId*"
+} | Select-Object -First 1
+if (-not $running) {
+    Start-Process -FilePath "npx.cmd" -ArgumentList @("tsx", "src/eval/ablation-v3.ts", "--model", $model, "--run-id", $runId, "--allow-dirty") -WorkingDirectory $ws -WindowStyle Hidden
+}
+"#;
+                        let _ = Command::new("powershell.exe")
+                            .args([
+                                "-NoProfile",
+                                "-NonInteractive",
+                                "-WindowStyle",
+                                "Hidden",
+                                "-Command",
+                                script,
+                            ])
+                            .env("DINOBUDS_RUN_ID", run_id)
+                            .env("DINOBUDS_MODEL", model)
+                            .env("DINOBUDS_WS", ws_str)
+                            .creation_flags(0x08000000)
+                            .spawn();
+                    });
+                }
+            }
+        }
+    } else {
+        {
+            let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+            resumed_map.remove(&id);
+        }
+        {
+            let mut approved_map = lock_or_recover(&approved_prompts.0);
+            approved_map.remove(&id);
+        }
+        {
+            let mut paused_map = lock_or_recover(&paused_sessions.0);
+            paused_map.insert(id.clone(), now);
+            save_paused_ids(&paused_map);
+        }
+        {
+            let mut manual_map = lock_or_recover(&manual);
+            if let Some(session) = manual_map.get_mut(&id) {
+                session.status = "paused".to_string();
+                session.question = None;
+                session.decision = None;
+                session.step_label = if session.total_steps > 0 {
+                    format!(
+                        "Paused at checkpoint ({}/{})",
+                        session.current_step, session.total_steps
+                    )
+                } else {
+                    "Paused".to_string()
+                };
+                session.updated_at = now;
+            }
+        }
+
+        if id.starts_with("axiom-") {
+            let run_id = existing_session
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| id.trim_start_matches("axiom-").to_string());
+
+            #[cfg(target_os = "windows")]
+            if !run_id.is_empty() {
+                std::thread::spawn(move || {
+                    let script = r#"
+$runId = $env:DINOBUDS_RUN_ID
+if (-not $runId) { exit 0 }
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'cmd.exe'" | Where-Object {
+    $_.CommandLine -and $_.CommandLine -like "*--run-id*$runId*"
+} | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+"#;
+                    let _ = Command::new("powershell.exe")
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-WindowStyle",
+                            "Hidden",
+                            "-Command",
+                            script,
+                        ])
+                        .env("DINOBUDS_RUN_ID", run_id)
+                        .creation_flags(0x08000000)
+                        .spawn();
+                });
+            }
+        }
+    }
+
+    let cached_auto = lock_or_recover(&auto_cache.0).clone();
+    reconcile_and_emit(
+        &state,
+        &manual,
+        &dismissed,
+        &approved_prompts,
+        &paused_sessions,
+        &resumed_sessions,
         &cached_auto,
         &app,
     )
@@ -1946,14 +2285,28 @@ struct DiscoveredConv {
     latest_log_mtime: u64,
     is_running: bool,
     is_waiting_permission: bool,
+    is_paused: bool,
+    is_subagent: bool,
+    pause_signal_ts: u64,
     pending_question: Option<String>,
-    last_command_line: Option<String>,
     mentioned_run_ids: Vec<String>,
     task_md: Option<TaskMdInfo>,
     last_user_prompt: Option<String>,
     last_tool_summary: Option<String>,
     tools_done: u32,
     tools_total: u32,
+}
+
+fn text_mentions_pause(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("pause all")
+        || lower.contains("have been stopped")
+        || lower.contains("saved checkpoints")
+        || lower.contains("stopped at checkpoint")
+        || lower.contains("paused at checkpoint")
+        || lower == "pause"
+        || lower.starts_with("pause ")
+        || lower.contains("\npause ")
 }
 
 fn clean_user_prompt_summary(content: &str) -> Option<String> {
@@ -2195,6 +2548,12 @@ fn detect_pending_approval(
         .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("GENERIC"))
         .collect();
 
+    if generics_after.iter().any(|v| {
+        v.get("status").and_then(|s| s.as_str()) == Some("RUNNING")
+    }) {
+        return None;
+    }
+
     let waiting_idx = generics_after.iter().position(|v| {
         matches!(
             v.get("status").and_then(|s| s.as_str()),
@@ -2228,10 +2587,10 @@ fn detect_pending_approval(
         name,
         "run_command" | "execute_command" | "bash" | "shell"
     ) {
-        if waiting_idx.is_none()
-            && latest_log_mtime >= transcript_mtime
-            && now.saturating_sub(latest_log_mtime) <= 45
-        {
+        if waiting_idx.is_none() && latest_log_mtime >= transcript_mtime {
+            return None;
+        }
+        if waiting_idx.is_none() && now.saturating_sub(transcript_mtime) > 180 {
             return None;
         }
 
@@ -2505,7 +2864,7 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             .map(|w| w.to_lowercase().contains("axiom"))
             .unwrap_or(false);
 
-        // Parse transcript tail for latest prompt, tool calls, running status, approvals, and benchmark updates
+        // Parse transcript tail for latest prompt, tool calls, running status, approvals, pause signals, and benchmark updates
         let mut last_user_prompt: Option<String> = None;
         let mut last_tool_summary: Option<String> = None;
         let mut last_step_type = String::new();
@@ -2515,8 +2874,9 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
         let mut tools_done = 0u32;
         let mut is_subagent_conv = false;
         let mut is_waiting_permission = false;
+        let mut conv_is_paused = false;
+        let mut pause_signal_ts = 0u64;
         let mut pending_question: Option<String> = None;
-        let mut last_command_line: Option<String> = None;
 
         if let Some((_, ref tail)) = head_tail {
             let mut parsed_entries: Vec<Value> = Vec::new();
@@ -2546,24 +2906,10 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             if let Some(tidx) = last_trigger_idx {
                 if let Some(content) = parsed_entries[tidx].get("content").and_then(|v| v.as_str()) {
                     last_user_prompt = clean_user_prompt_summary(content);
-                }
-            }
-
-            for entry in &parsed_entries {
-                if entry.get("type").and_then(|t| t.as_str()) == Some("PLANNER_RESPONSE") {
-                    if let Some(calls) = entry.get("tool_calls").and_then(|c| c.as_array()) {
-                        for call in calls {
-                            let cname = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            if matches!(cname, "run_command" | "execute_command" | "bash" | "shell") {
-                                if let Some(cmd) = call
-                                    .get("args")
-                                    .and_then(|a| a.get("CommandLine").or_else(|| a.get("command")))
-                                    .and_then(unquote_json_arg)
-                                {
-                                    if !cmd.trim().is_empty() {
-                                        last_command_line = Some(cmd);
-                                    }
-                                }
+                    if !is_subagent_conv {
+                        if let Some(ref summary) = last_user_prompt {
+                            if summary.len() <= 140 && text_mentions_pause(summary) {
+                                conv_is_paused = true;
                             }
                         }
                     }
@@ -2575,15 +2921,34 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                 None => &parsed_entries[..],
             };
 
+            let mut turn_killed_subagents = false;
+            let mut last_planner_content = String::new();
             for entry in turn_slice {
                 let etype = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 let estatus = entry.get("status").and_then(|s| s.as_str()).unwrap_or("");
 
                 if etype == "PLANNER_RESPONSE" {
+                    if let Some(content) = entry.get("content").and_then(|v| v.as_str()) {
+                        last_planner_content = content.to_string();
+                    }
                     if let Some(calls) = entry.get("tool_calls").and_then(|c| c.as_array()) {
                         if !calls.is_empty() {
                             last_planner_has_tools = true;
                             tools_total += calls.len() as u32;
+                            for call in calls {
+                                let cname = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if cname == "manage_subagents" {
+                                    let action = call
+                                        .get("args")
+                                        .and_then(|a| a.get("Action").or_else(|| a.get("action")))
+                                        .and_then(unquote_json_arg)
+                                        .unwrap_or_default()
+                                        .to_lowercase();
+                                    if action == "kill" || action == "kill_all" {
+                                        turn_killed_subagents = true;
+                                    }
+                                }
+                            }
                             if let Some(last_call) = calls.last() {
                                 if let Some(summary) = format_tool_summary(last_call) {
                                     last_tool_summary = Some(summary);
@@ -2624,16 +2989,34 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                 tools_done = tools_total;
             }
 
-            if let Some((approval_label, approval_question)) = detect_pending_approval(
-                &parsed_entries,
-                now,
-                transcript_mtime,
-                latest_non_dino_log_mtime,
-                is_subagent_conv,
-            ) {
-                is_waiting_permission = true;
-                pending_question = Some(approval_question);
-                last_tool_summary = Some(approval_label);
+            let planner_declares_pause = !last_planner_has_tools
+                && !last_planner_content.is_empty()
+                && (last_planner_content.to_lowercase().contains("have been stopped")
+                    || last_planner_content.to_lowercase().contains("saved checkpoints")
+                    || last_planner_content.to_lowercase().contains("paused at checkpoint"));
+
+            if !has_running_tool && (turn_killed_subagents || planner_declares_pause) {
+                conv_is_paused = true;
+            }
+            if has_running_tool && !turn_killed_subagents && !planner_declares_pause {
+                conv_is_paused = false;
+            }
+            if conv_is_paused {
+                pause_signal_ts = transcript_mtime;
+            }
+
+            if !conv_is_paused {
+                if let Some((approval_label, approval_question)) = detect_pending_approval(
+                    &parsed_entries,
+                    now,
+                    transcript_mtime,
+                    latest_non_dino_log_mtime,
+                    is_subagent_conv,
+                ) {
+                    is_waiting_permission = true;
+                    pending_question = Some(approval_question);
+                    last_tool_summary = Some(approval_label);
+                }
             }
         }
 
@@ -2691,7 +3074,9 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
         };
 
         let recent_activity = now.saturating_sub(transcript_mtime.max(latest_non_dino_log_mtime)) <= 120;
-        let is_running = if is_waiting_permission {
+        let is_running = if conv_is_paused {
+            false
+        } else if is_waiting_permission {
             true
         } else if let Some(ref tm) = task_md {
             if tm.total > 0 && tm.completed == tm.total && tm.in_progress == 0 && !recent_activity {
@@ -2717,8 +3102,10 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             latest_log_mtime: latest_non_dino_log_mtime,
             is_running,
             is_waiting_permission,
+            is_paused: conv_is_paused,
+            is_subagent: is_subagent_conv,
+            pause_signal_ts,
             pending_question,
-            last_command_line,
             mentioned_run_ids,
             task_md,
             last_user_prompt,
@@ -2726,6 +3113,39 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             tools_done,
             tools_total,
         });
+    }
+
+    // Track the newest pause-all signal timestamp per workspace (from main conversations)
+    let mut pause_ts_by_workspace: HashMap<String, u64> = HashMap::new();
+    let mut axiom_global_pause_ts = 0u64;
+    for conv in &convs {
+        if conv.is_paused && !conv.is_subagent && conv.pause_signal_ts > 0 {
+            if let Some(ref ws) = conv.workspace_path {
+                let ws_key = ws.to_lowercase();
+                let entry = pause_ts_by_workspace.entry(ws_key.clone()).or_insert(0);
+                *entry = (*entry).max(conv.pause_signal_ts);
+                if ws_key.contains("axiom") {
+                    axiom_global_pause_ts = axiom_global_pause_ts.max(conv.pause_signal_ts);
+                }
+            }
+        }
+    }
+
+    // Supersede stale waiting_permission flags on subagents/convs older than their workspace's pause turn
+    for conv in &mut convs {
+        let ws_pause_ts = conv
+            .workspace_path
+            .as_ref()
+            .and_then(|ws| pause_ts_by_workspace.get(&ws.to_lowercase()).copied())
+            .unwrap_or(0);
+        if conv.is_paused || (ws_pause_ts > 0 && conv.updated_at <= ws_pause_ts + 5) {
+            conv.is_waiting_permission = false;
+            conv.pending_question = None;
+            if conv.is_subagent || ws_pause_ts > 0 {
+                conv.is_paused = true;
+                conv.is_running = false;
+            }
+        }
     }
 
     // Source B: Scan Axiom directories on disk
@@ -2762,6 +3182,7 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
     let mut sessions: Vec<AgentSession> = Vec::new();
 
     for (_, mut rec) in benchmark_runs {
+        let disk_or_log_mtime = rec.updated_at;
         let mut candidate_uuids: Vec<String> = Vec::new();
         if let Some(ref uuid) = rec.linked_uuid {
             candidate_uuids.push(uuid.clone());
@@ -2789,11 +3210,9 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             ub.cmp(&ua)
         });
 
-        let mut max_conv_updated = 0u64;
         let mut max_linked_log_mtime = 0u64;
-        let mut any_active_running_tool = false;
+        let mut conv_explicitly_paused = false;
         let mut waiting_conv_question: Option<(u64, String, String)> = None;
-        let mut latest_conv_cmd: Option<String> = None;
 
         for uuid in candidate_uuids {
             if let Some(conv) = conv_by_id.get(&uuid) {
@@ -2807,20 +3226,12 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                     rec.workspace_path = conv.workspace_path.clone();
                 }
 
-                max_conv_updated = max_conv_updated.max(conv.updated_at);
                 max_linked_log_mtime = max_linked_log_mtime.max(conv.latest_log_mtime);
-                if latest_conv_cmd.is_none() {
-                    if let Some(ref cmd) = conv.last_command_line {
-                        if extract_all_run_ids(cmd)
-                            .iter()
-                            .any(|r| r.eq_ignore_ascii_case(&rec.name))
-                        {
-                            latest_conv_cmd = Some(cmd.clone());
-                        }
-                    }
+                if conv.is_paused {
+                    conv_explicitly_paused = true;
                 }
 
-                if conv.is_waiting_permission {
+                if conv.is_waiting_permission && !conv.is_paused {
                     let q_mentions_other = conv
                         .pending_question
                         .as_deref()
@@ -2837,52 +3248,47 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                                 .unwrap_or_else(|| "Needs Approval".to_string()),
                             conv.pending_question
                                 .clone()
-                                .unwrap_or_else(|| "Agent stopped — waiting for Submit ⏎".to_string()),
+                                .unwrap_or_else(|| "Allow command? — waiting for Submit ⏎".to_string()),
                         ));
                     }
-                } else if conv.is_running && now.saturating_sub(conv.latest_log_mtime) <= 45 {
-                    any_active_running_tool = true;
-                }
-
-                if rec.current_step < rec.total_steps && conv.is_running {
-                    rec.status = "running".to_string();
                 }
             }
         }
+
+        let ws_pause_ts = rec
+            .workspace_path
+            .as_ref()
+            .and_then(|ws| pause_ts_by_workspace.get(&ws.to_lowercase()).copied())
+            .unwrap_or(axiom_global_pause_ts);
+        let last_active_write = disk_or_log_mtime.max(max_linked_log_mtime);
 
         if rec.current_step < rec.total_steps {
-            if let Some((_, step_lbl, q)) = waiting_conv_question {
-                rec.status = "waiting_permission".to_string();
-                rec.step_label = step_lbl;
-                rec.question = Some(q);
-            } else if max_conv_updated > 0
-                && now.saturating_sub(max_conv_updated) <= 7200
-                && !any_active_running_tool
-                && now.saturating_sub(rec.updated_at.max(max_linked_log_mtime)) > 45
-            {
-                rec.status = "waiting_permission".to_string();
-                rec.step_label = "Stopped — Submit".to_string();
-                let q = latest_conv_cmd
-                    .map(|cmd| {
-                        format!(
-                            "Allow resume {}? — {}",
-                            rec.name,
-                            truncate_str(&cmd, 130)
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "Agent stopped (>45s idle) — Allow resume {}? Submit ⏎",
-                            rec.name
-                        )
-                    });
-                rec.question = Some(q);
-            }
-        }
+            let has_live_approval = waiting_conv_question
+                .as_ref()
+                .map(|(wait_ts, _, _)| *wait_ts > ws_pause_ts && !conv_explicitly_paused)
+                .unwrap_or(false);
 
-        // If incomplete benchmark has been idle > 1h (and not waiting permission), show queued instead of running
-        if rec.status == "running" && now.saturating_sub(rec.updated_at) > 3600 {
-            rec.status = "queued".to_string();
+            if has_live_approval {
+                if let Some((_, step_lbl, q)) = waiting_conv_question {
+                    rec.status = "waiting_permission".to_string();
+                    rec.step_label = step_lbl;
+                    rec.question = Some(q);
+                }
+            } else if rec.current_step > 0
+                && (now.saturating_sub(last_active_write) > 30
+                    || conv_explicitly_paused
+                    || (ws_pause_ts > 0 && last_active_write <= ws_pause_ts + 10))
+            {
+                rec.status = "paused".to_string();
+                rec.step_label = format!(
+                    "Paused at checkpoint ({}/{})",
+                    rec.current_step, rec.total_steps
+                );
+                rec.question = None;
+            } else if rec.current_step > 0 {
+                rec.status = "running".to_string();
+                rec.question = None;
+            }
         }
 
         if rec.workspace_path.is_none() {
@@ -2922,7 +3328,13 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                 .clone()
                 .or_else(|| conv.last_user_prompt.clone())
                 .unwrap_or_else(|| "Antigravity Task".to_string());
-            let label = if conv.is_waiting_permission {
+            let label = if conv.is_paused {
+                if tm.total > 0 && tm.completed < tm.total {
+                    format!("Paused at checkpoint ({}/{})", tm.completed, tm.total)
+                } else {
+                    "Paused".to_string()
+                }
+            } else if conv.is_waiting_permission {
                 conv.last_tool_summary
                     .clone()
                     .unwrap_or_else(|| "Needs Approval".to_string())
@@ -2943,14 +3355,26 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                 .last_user_prompt
                 .clone()
                 .unwrap_or_else(|| "Antigravity Session".to_string());
-            let label = conv
-                .last_tool_summary
-                .clone()
-                .unwrap_or_else(|| if conv.is_running { "Running" } else { "Idle" }.to_string());
+            let label = if conv.is_paused {
+                if conv.tools_total > 0 && conv.tools_done < conv.tools_total {
+                    format!(
+                        "Paused at checkpoint ({}/{})",
+                        conv.tools_done, conv.tools_total
+                    )
+                } else {
+                    "Paused".to_string()
+                }
+            } else {
+                conv.last_tool_summary
+                    .clone()
+                    .unwrap_or_else(|| if conv.is_running { "Running" } else { "Idle" }.to_string())
+            };
             (conv.tools_done, conv.tools_total, label, title)
         };
 
-        let status = if conv.is_waiting_permission {
+        let status = if conv.is_paused {
+            "paused"
+        } else if conv.is_waiting_permission {
             "waiting_permission"
         } else if conv.is_running {
             "running"
@@ -2958,6 +3382,12 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             "done"
         }
         .to_string();
+
+        let question = if status == "paused" {
+            None
+        } else {
+            conv.pending_question
+        };
 
         sessions.push(AgentSession {
             id: conv.id,
@@ -2967,7 +3397,7 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
             current_step,
             total_steps,
             step_label: truncate_str(&step_label, 42),
-            question: conv.pending_question,
+            question,
             workspace_path: conv.workspace_path,
             decision: None,
             updated_at: conv.updated_at,
@@ -2983,6 +3413,8 @@ fn spawn_auto_discovery_watcher(
     manual: ManualSessions,
     dismissed: DismissedSessions,
     approved_prompts: ApprovedPrompts,
+    paused_sessions: PausedSessions,
+    resumed_sessions: ResumedSessions,
     auto_cache: AutoDiscoveredCache,
 ) {
     std::thread::spawn(move || loop {
@@ -2998,6 +3430,8 @@ fn spawn_auto_discovery_watcher(
                         &manual,
                         &dismissed,
                         &approved_prompts,
+                        &paused_sessions,
+                        &resumed_sessions,
                         &discovered,
                         &app_handle,
                     );
@@ -3037,6 +3471,8 @@ fn spawn_telemetry_server(
     manual: ManualSessions,
     dismissed: DismissedSessions,
     approved_prompts: ApprovedPrompts,
+    paused_sessions: PausedSessions,
+    resumed_sessions: ResumedSessions,
     auto_cache: AutoDiscoveredCache,
 ) {
     std::thread::spawn(move || {
@@ -3123,6 +3559,12 @@ fn spawn_telemetry_server(
                                 let mut dismissed_map = lock_or_recover(&dismissed);
                                 dismissed_map.remove(&incoming.id);
                             }
+                            if incoming.status != "paused" {
+                                let mut paused_map = lock_or_recover(&paused_sessions.0);
+                                if paused_map.remove(&incoming.id).is_some() {
+                                    save_paused_ids(&paused_map);
+                                }
+                            }
                             {
                                 let mut manual_map = lock_or_recover(&manual);
                                 manual_map.insert(incoming.id.clone(), incoming);
@@ -3134,6 +3576,8 @@ fn spawn_telemetry_server(
                                 &manual,
                                 &dismissed,
                                 &approved_prompts,
+                                &paused_sessions,
+                                &resumed_sessions,
                                 &cached_auto,
                                 &app_handle,
                             );
@@ -3178,12 +3622,20 @@ fn spawn_telemetry_server(
                     let mut manual_map = lock_or_recover(&manual);
                     manual_map.remove(&id);
                 }
+                {
+                    let mut paused_map = lock_or_recover(&paused_sessions.0);
+                    if paused_map.remove(&id).is_some() {
+                        save_paused_ids(&paused_map);
+                    }
+                }
                 let cached_auto = lock_or_recover(&auto_cache.0).clone();
                 let updated_list = reconcile_and_emit(
                     &shared,
                     &manual,
                     &dismissed,
                     &approved_prompts,
+                    &paused_sessions,
+                    &resumed_sessions,
                     &cached_auto,
                     &app_handle,
                 );
@@ -3912,6 +4364,8 @@ pub fn run() {
     let manual_sessions: ManualSessions = Arc::new(Mutex::new(HashMap::new()));
     let dismissed_sessions: DismissedSessions = Arc::new(Mutex::new(HashMap::new()));
     let approved_prompts = ApprovedPrompts::default();
+    let paused_sessions = PausedSessions(Arc::new(Mutex::new(load_paused_ids())));
+    let resumed_sessions = ResumedSessions::default();
     let auto_cache = AutoDiscoveredCache(Arc::new(Mutex::new(Vec::new())));
     let ojt_state: SharedOjtState = Arc::new(Mutex::new(load_ojt_state()));
 
@@ -3921,6 +4375,8 @@ pub fn run() {
         .manage(manual_sessions.clone())
         .manage(dismissed_sessions.clone())
         .manage(approved_prompts.clone())
+        .manage(paused_sessions.clone())
+        .manage(resumed_sessions.clone())
         .manage(auto_cache.clone())
         .manage(ojt_state.clone())
         .setup(move |app| {
@@ -3933,6 +4389,8 @@ pub fn run() {
             let manual = app.state::<ManualSessions>().inner().clone();
             let dismissed = app.state::<DismissedSessions>().inner().clone();
             let approved = app.state::<ApprovedPrompts>().inner().clone();
+            let paused = app.state::<PausedSessions>().inner().clone();
+            let resumed = app.state::<ResumedSessions>().inner().clone();
             let cache = app.state::<AutoDiscoveredCache>().inner().clone();
 
             spawn_telemetry_server(
@@ -3941,15 +4399,20 @@ pub fn run() {
                 manual.clone(),
                 dismissed.clone(),
                 approved.clone(),
+                paused.clone(),
+                resumed.clone(),
                 cache.clone(),
             );
-            spawn_auto_discovery_watcher(handle, shared, manual, dismissed, approved, cache);
+            spawn_auto_discovery_watcher(
+                handle, shared, manual, dismissed, approved, paused, resumed, cache,
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_sessions,
             resolve_permission,
             submit_agent_prompt,
+            toggle_pause_session,
             dismiss_session,
             focus_workspace,
             snap_to_top_right,

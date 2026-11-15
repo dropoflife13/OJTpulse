@@ -28,13 +28,14 @@ import {
   History,
   ListChecks,
   Save,
+  Pause,
 } from "lucide-react";
 import "./App.css";
 
-type AgentStatus = "running" | "waiting_permission" | "queued" | "done" | string;
+type AgentStatus = "running" | "waiting_permission" | "paused" | "queued" | "done" | string;
 type WindowMode = "top-right" | "floating";
 type ActiveTab = "agents" | "reaper" | "ojt";
-type AgentFilter = "active" | "done" | "all";
+type AgentFilter = "active" | "paused" | "done" | "all";
 type OjtSubTab = "today" | "history" | "settings";
 
 interface ShiftSession {
@@ -326,6 +327,33 @@ function PixelDinoAvatar({
     );
   }
 
+  if (status === "paused") {
+    // Sleeping Amber/Slate Dino (#fbbf24 / #94a3b8) with calm "Zz" breath
+    return (
+      <div
+        aria-hidden="true"
+        className={`dino-avatar ui-chrome relative flex items-center justify-center ${boxSize} bg-amber-500/10 border border-amber-500/35 shrink-0`}
+      >
+        <svg viewBox="0 0 16 16" className={svgSize} shapeRendering="crispEdges">
+          <g className="dino-sparkle">
+            <rect x="12" y="2" width="2" height="1" fill="#fde68a" />
+            <rect x="12" y="3" width="1" height="1" fill="#fde68a" />
+            <rect x="12" y="4" width="2" height="1" fill="#fde68a" />
+          </g>
+          <g className="dino-tri-breathe">
+            <rect x="7" y="6" width="5" height="3" fill="#f59e0b" />
+            <rect x="9" y="7" width="2" height="1" fill="#451a03" />
+            <rect x="3" y="9" width="8" height="4" fill="#f59e0b" />
+            <rect x="4" y="10" width="5" height="2" fill="#fbbf24" />
+            <rect x="1" y="11" width="2" height="2" fill="#d97706" />
+            <rect x="4" y="13" width="2" height="1" fill="#b45309" />
+            <rect x="8" y="13" width="2" height="1" fill="#b45309" />
+          </g>
+        </svg>
+      </div>
+    );
+  }
+
   if (status === "queued") {
     // Animated Wobbling Yellow Dino Egg (#facc15)
     return (
@@ -412,6 +440,12 @@ function StatusBadge({ status }: { status: AgentStatus }) {
       return (
         <span className="ui-chrome px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
           Running
+        </span>
+      );
+    case "paused":
+      return (
+        <span className="ui-chrome px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+          Paused
         </span>
       );
     case "queued":
@@ -795,11 +829,21 @@ export default function App() {
     }
   };
 
+  const handleTogglePause = async (id: string) => {
+    try {
+      const updated = await invoke<AgentSession[]>("toggle_pause_session", { id });
+      setAgents(updated);
+    } catch (err) {
+      console.error("Failed to toggle pause:", err);
+    }
+  };
+
   const statusRank = (status: AgentStatus) => {
     if (status === "waiting_permission") return 0;
     if (status === "running") return 1;
-    if (status === "queued") return 2;
-    return 3;
+    if (status === "paused") return 2;
+    if (status === "queued") return 3;
+    return 4;
   };
 
   const sortSessionsByPriority = (list: AgentSession[]) =>
@@ -810,7 +854,15 @@ export default function App() {
     });
 
   const activeAgents = sortSessionsByPriority(
-    agents.filter((a) => a.status !== "done")
+    agents.filter(
+      (a) =>
+        a.status === "waiting_permission" ||
+        a.status === "running" ||
+        a.status === "queued"
+    )
+  );
+  const pausedAgents = sortSessionsByPriority(
+    agents.filter((a) => a.status === "paused")
   );
   const doneAgents = sortSessionsByPriority(
     agents.filter((a) => a.status === "done")
@@ -819,9 +871,11 @@ export default function App() {
   const filteredAgents =
     agentFilter === "active"
       ? activeAgents
-      : agentFilter === "done"
-        ? doneAgents
-        : allAgents;
+      : agentFilter === "paused"
+        ? pausedAgents
+        : agentFilter === "done"
+          ? doneAgents
+          : allAgents;
 
   const waitingCount = agents.filter(
     (a) => a.status === "waiting_permission"
@@ -831,7 +885,9 @@ export default function App() {
       ? "waiting_permission"
       : agents.some((a) => a.status === "running")
         ? "running"
-        : "done";
+        : pausedAgents.length > 0
+          ? "paused"
+          : "done";
 
   return (
     <div
@@ -1044,7 +1100,7 @@ export default function App() {
       {/* Main Content Area */}
       {!collapsed && activeTab === "agents" && (
         <>
-          <div className="ui-chrome shrink-0 px-2.5 pt-2 pb-1 flex items-center justify-between gap-2 border-b border-zinc-800/50 bg-zinc-950/60">
+          <div className="ui-chrome shrink-0 px-2.5 pt-2 pb-1 flex items-center justify-between gap-1.5 border-b border-zinc-800/50 bg-zinc-950/60">
             <div
               role="group"
               aria-label="Filter agents by status"
@@ -1053,6 +1109,7 @@ export default function App() {
               {(
                 [
                   { id: "active", label: "Active", count: activeAgents.length },
+                  { id: "paused", label: "Paused", count: pausedAgents.length },
                   { id: "done", label: "Done", count: doneAgents.length },
                   { id: "all", label: "All", count: agents.length },
                 ] as const
@@ -1064,7 +1121,7 @@ export default function App() {
                     type="button"
                     aria-pressed={isSelected}
                     onClick={() => setAgentFilter(option.id)}
-                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
+                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
                       isSelected
                         ? "bg-zinc-800 text-zinc-100 border border-zinc-700/70 shadow-sm"
                         : "text-zinc-400 hover:text-zinc-200 border border-transparent"
@@ -1073,11 +1130,13 @@ export default function App() {
                     <span>{option.label}</span>
                     <span
                       className={`font-mono text-[9px] px-1 rounded ${
-                        isSelected
-                          ? option.id === "active" && activeAgents.length > 0
-                            ? "bg-emerald-500/20 text-emerald-300"
-                            : "bg-zinc-700/70 text-zinc-300"
-                          : "text-zinc-500"
+                        option.id === "paused" && option.count > 0
+                          ? "bg-amber-500/20 text-amber-300"
+                          : isSelected
+                            ? option.id === "active" && activeAgents.length > 0
+                              ? "bg-emerald-500/20 text-emerald-300"
+                              : "bg-zinc-700/70 text-zinc-300"
+                            : "text-zinc-500"
                       }`}
                     >
                       {option.count}
@@ -1088,8 +1147,8 @@ export default function App() {
             </div>
 
             {waitingCount > 0 && (
-              <span className="text-[10px] font-medium text-rose-300 bg-rose-500/15 border border-rose-500/30 rounded-full px-2 py-0.5 shrink-0">
-                {waitingCount} need review
+              <span className="text-[9.5px] font-medium text-rose-300 bg-rose-500/15 border border-rose-500/30 rounded-full px-1.5 py-0.5 shrink-0">
+                {waitingCount} review
               </span>
             )}
           </div>
@@ -1111,14 +1170,27 @@ export default function App() {
                 <p className="text-xs font-medium text-zinc-400">
                   {agentFilter === "active"
                     ? "No active agents right now"
-                    : "No completed agents yet"}
+                    : agentFilter === "paused"
+                      ? "No paused checkpoints right now"
+                      : "No completed agents yet"}
                 </p>
                 <p className="text-[11px] text-zinc-600 mt-1">
-                  {agentFilter === "active" && doneAgents.length > 0
-                    ? `${doneAgents.length} completed run${doneAgents.length === 1 ? "" : "s"} in Done.`
-                    : `Total tracked sessions: ${agents.length}.`}
+                  {agentFilter === "active" && pausedAgents.length > 0
+                    ? `${pausedAgents.length} paused checkpoint${pausedAgents.length === 1 ? "" : "s"} in Paused.`
+                    : agentFilter === "active" && doneAgents.length > 0
+                      ? `${doneAgents.length} completed run${doneAgents.length === 1 ? "" : "s"} in Done.`
+                      : `Total tracked sessions: ${agents.length}.`}
                 </p>
-                <div className="flex items-center gap-1.5 mt-3">
+                <div className="flex flex-wrap items-center justify-center gap-1.5 mt-3">
+                  {agentFilter !== "paused" && pausedAgents.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setAgentFilter("paused")}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[11px] font-medium transition-colors cursor-pointer"
+                    >
+                      View Paused ({pausedAgents.length})
+                    </button>
+                  )}
                   {agentFilter !== "done" && doneAgents.length > 0 && (
                     <button
                       type="button"
@@ -1163,7 +1235,9 @@ export default function App() {
                   className={`group relative rounded-xl p-2.5 transition-all border ${
                     agent.status === "waiting_permission"
                       ? "bg-rose-950/20 border-rose-500/40 shadow-lg shadow-rose-950/20"
-                      : "bg-zinc-900/70 border-zinc-800/80 hover:border-zinc-700/80"
+                      : agent.status === "paused"
+                        ? "bg-amber-950/10 border-amber-500/30 hover:border-amber-500/50"
+                        : "bg-zinc-900/70 border-zinc-800/80 hover:border-zinc-700/80"
                   }`}
                 >
                   <div className="flex items-start gap-2.5">
@@ -1183,6 +1257,28 @@ export default function App() {
                         </div>
 
                         <div className="ui-chrome flex items-center gap-1 shrink-0">
+                          {(agent.status === "running" ||
+                            agent.status === "waiting_permission") && (
+                            <button
+                              type="button"
+                              onClick={() => handleTogglePause(agent.id)}
+                              title="Pause session at current checkpoint"
+                              className="p-1 rounded-md text-amber-400/90 hover:text-amber-300 hover:bg-amber-500/15 transition-colors cursor-pointer"
+                            >
+                              <Pause className="w-3 h-3" />
+                            </button>
+                          )}
+                          {agent.status === "paused" && (
+                            <button
+                              type="button"
+                              onClick={() => handleTogglePause(agent.id)}
+                              title="Resume checkpoint"
+                              className="flex items-center gap-0.5 px-1.5 py-0.5 rounded-md bg-emerald-500/15 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[9.5px] font-semibold transition-colors cursor-pointer"
+                            >
+                              <Play className="w-2.5 h-2.5 fill-current" />
+                              <span>Resume</span>
+                            </button>
+                          )}
                           {agent.workspace_path && (
                             <button
                               type="button"
@@ -1231,9 +1327,11 @@ export default function App() {
                                 ? "bg-purple-500"
                                 : agent.status === "waiting_permission"
                                   ? "bg-amber-400"
-                                  : agent.status === "queued"
-                                    ? "bg-yellow-400"
-                                    : "dino-progress-active"
+                                  : agent.status === "paused"
+                                    ? "bg-amber-400/80"
+                                    : agent.status === "queued"
+                                      ? "bg-yellow-400"
+                                      : "dino-progress-active"
                             }`}
                             style={{ width: `${progressPct}%` }}
                           />
@@ -1271,6 +1369,14 @@ export default function App() {
                             >
                               <Check className="w-3 h-3 text-emerald-400" />
                               <span>Allow (2)</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleTogglePause(agent.id)}
+                              title="Mark as Paused & stop alarm"
+                              className="flex items-center justify-center gap-1 py-1 px-2 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px] font-medium transition-colors cursor-pointer"
+                            >
+                              <Pause className="w-3 h-3" />
                             </button>
                             <button
                               type="button"
