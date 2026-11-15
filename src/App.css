@@ -1,0 +1,378 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+::selection {
+  background: rgba(52, 211, 153, 0.28);
+  color: #ecfdf5;
+}
+
+.ui-chrome {
+  user-select: none;
+}
+
+/* Custom Accessible Scrollbar */
+.dino-scroller {
+  --scrollbar-thumb: #71717a;
+  --scrollbar-track: #18181b;
+
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+}
+
+@media (prefers-contrast: more) {
+  .dino-scroller {
+    --scrollbar-thumb: #ffffff;
+    --scrollbar-track: #000000;
+  }
+}
+
+@supports not (scrollbar-color: auto) {
+  .dino-scroller::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .dino-scroller::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+
+  .dino-scroller::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+    border-radius: 9999px;
+  }
+}
+
+/* Animated Pixel Dino Avatars (Individual Transform Properties) */
+.dino-avatar {
+  translate: 0px;
+  rotate: 0deg;
+  scale: 1;
+  transition: scale 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.dino-avatar:hover,
+.group:hover .dino-avatar {
+  scale: 1.08;
+}
+
+.dino-march,
+.dino-leg-front,
+.dino-leg-back,
+.dino-tail-wag,
+.dino-eye-blink,
+.dino-foot-dust,
+.dino-trex-hop,
+.dino-jaw-chomp,
+.dino-arm-wave,
+.dino-alert-bob,
+.dino-egg-wobble,
+.dino-egg-crack,
+.dino-tri-breathe,
+.dino-sparkle {
+  translate: 0px;
+  rotate: 0deg;
+  scale: 1;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.dino-march {
+  animation: dino-march 0.55s steps(2, end) infinite;
+}
+
+.dino-leg-front {
+  animation: dino-leg-a 0.4s steps(2, end) infinite;
+}
+
+.dino-leg-back {
+  animation: dino-leg-b 0.4s steps(2, end) infinite;
+}
+
+.dino-tail-wag {
+  transform-origin: right center;
+  animation: dino-tail-wag 0.65s steps(2, end) infinite;
+}
+
+.dino-eye-blink {
+  animation: dino-eye-blink 3.6s linear infinite;
+}
+
+.dino-foot-dust {
+  animation: dino-foot-dust 0.7s steps(3, end) infinite;
+}
+
+.dino-trex-hop {
+  animation: dino-trex-hop 0.75s steps(2, end) infinite;
+}
+
+.dino-jaw-chomp {
+  animation: dino-jaw-chomp 0.65s steps(2, end) infinite;
+}
+
+.dino-arm-wave {
+  animation: dino-arm-wave 0.45s steps(2, end) infinite;
+}
+
+.dino-alert-bob {
+  animation: dino-alert-bob 0.8s steps(2, end) infinite;
+}
+
+.dino-egg-wobble {
+  transform-origin: 50% 85%;
+  animation: dino-egg-wobble 2.2s ease-in-out infinite;
+}
+
+.dino-egg-crack {
+  animation: dino-egg-crack 2.2s ease-in-out infinite;
+}
+
+.dino-tri-breathe {
+  animation: dino-tri-breathe 1.8s steps(2, end) infinite;
+}
+
+.dino-sparkle {
+  animation: dino-sparkle 1.4s ease-in-out infinite;
+}
+
+.dino-progress-active {
+  background-image: linear-gradient(
+    90deg,
+    #34d399 0%,
+    #38bdf8 45%,
+    #6ee7b7 55%,
+    #38bdf8 100%
+  );
+  background-size: 200% 100%;
+  animation: dino-shimmer 2.2s linear infinite;
+}
+
+@keyframes dino-march {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 -1px;
+  }
+}
+
+@keyframes dino-leg-a {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 -1px;
+  }
+}
+
+@keyframes dino-leg-b {
+  0%,
+  100% {
+    translate: 0 -1px;
+  }
+  50% {
+    translate: 0 0;
+  }
+}
+
+@keyframes dino-tail-wag {
+  0%,
+  100% {
+    translate: 0 0;
+    rotate: 0deg;
+  }
+  50% {
+    translate: -0.4px -0.5px;
+    rotate: 6deg;
+  }
+}
+
+@keyframes dino-eye-blink {
+  0%,
+  88%,
+  100% {
+    scale: 1 1;
+  }
+  92%,
+  96% {
+    scale: 1 0.15;
+  }
+}
+
+@keyframes dino-foot-dust {
+  0% {
+    translate: 0 0;
+    scale: 0.9;
+    opacity: 0.85;
+  }
+  50% {
+    translate: -1.4px -0.6px;
+    scale: 1.1;
+    opacity: 0.45;
+  }
+  100% {
+    translate: -2.4px -1px;
+    scale: 0.6;
+    opacity: 0;
+  }
+}
+
+@keyframes dino-trex-hop {
+  0%,
+  100% {
+    translate: 0 0;
+    rotate: 0deg;
+  }
+  25% {
+    translate: 0 -1.2px;
+    rotate: -3deg;
+  }
+  50% {
+    translate: 0 0;
+    rotate: 0deg;
+  }
+  75% {
+    translate: 0 -0.9px;
+    rotate: 2.5deg;
+  }
+}
+
+@keyframes dino-jaw-chomp {
+  0%,
+  40%,
+  100% {
+    translate: 0 0;
+  }
+  60%,
+  85% {
+    translate: 0 0.9px;
+  }
+}
+
+@keyframes dino-arm-wave {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 -0.8px;
+  }
+}
+
+@keyframes dino-alert-bob {
+  0%,
+  100% {
+    translate: 0 0;
+    opacity: 1;
+  }
+  50% {
+    translate: 0 -1px;
+    opacity: 0.35;
+  }
+}
+
+@keyframes dino-egg-wobble {
+  0%,
+  35%,
+  100% {
+    translate: 0 0;
+    rotate: 0deg;
+  }
+  45% {
+    translate: 0 -0.8px;
+    rotate: -8deg;
+  }
+  55% {
+    translate: 0 -0.4px;
+    rotate: 7deg;
+  }
+  65% {
+    translate: 0 -0.6px;
+    rotate: -5deg;
+  }
+  75% {
+    translate: 0 0;
+    rotate: 0deg;
+  }
+}
+
+@keyframes dino-egg-crack {
+  0%,
+  40%,
+  100% {
+    opacity: 0.35;
+  }
+  55%,
+  75% {
+    opacity: 1;
+  }
+}
+
+@keyframes dino-tri-breathe {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 -0.7px;
+  }
+}
+
+@keyframes dino-sparkle {
+  0%,
+  100% {
+    scale: 0.65;
+    opacity: 0.25;
+  }
+  50% {
+    scale: 1.15;
+    opacity: 1;
+  }
+}
+
+@keyframes dino-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dino-avatar {
+    transition: none;
+  }
+  .dino-march,
+  .dino-leg-front,
+  .dino-leg-back,
+  .dino-tail-wag,
+  .dino-eye-blink,
+  .dino-foot-dust,
+  .dino-trex-hop,
+  .dino-jaw-chomp,
+  .dino-arm-wave,
+  .dino-alert-bob,
+  .dino-egg-wobble,
+  .dino-egg-crack,
+  .dino-tri-breathe,
+  .dino-sparkle,
+  .dino-progress-active {
+    animation: none !important;
+  }
+}
