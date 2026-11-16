@@ -686,6 +686,163 @@ fn extract_model_for_axiom_run(
     None
 }
 
+fn list_live_axiom_run_ids() -> HashSet<String> {
+    let mut active_runs = HashSet::new();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
+    for proc_info in sys.processes().values() {
+        let name = proc_info.name().to_string_lossy().to_lowercase();
+        if !name.contains("node") && !name.contains("cmd") {
+            continue;
+        }
+        let args: Vec<String> = proc_info
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        let joined = args.join(" ").to_lowercase();
+        if !joined.contains("ablation") || !joined.contains("--run-id") {
+            continue;
+        }
+        for i in 0..args.len() {
+            if args[i] == "--run-id" {
+                if let Some(val) = args.get(i + 1) {
+                    let clean = val.trim().trim_matches('"').to_lowercase();
+                    if !clean.is_empty() {
+                        active_runs.insert(clean);
+                    }
+                }
+            } else if let Some(val) = args[i].strip_prefix("--run-id=") {
+                let clean = val.trim().trim_matches('"').to_lowercase();
+                if !clean.is_empty() {
+                    active_runs.insert(clean);
+                }
+            }
+        }
+    }
+    active_runs
+}
+
+fn has_live_axiom_process(run_id: &str) -> bool {
+    let needle = run_id.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    list_live_axiom_run_ids().contains(&needle)
+}
+
+fn trigger_antigravity_resume_ui(ws_hint: Option<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        let hint = ws_hint
+            .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+            .unwrap_or("")
+            .to_string();
+
+        std::thread::spawn(move || {
+            let script = r#"
+Start-Sleep -Milliseconds 60
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class DinoResumeWin {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    public static void ClickAt(int x, int y) {
+        POINT orig;
+        bool hasOrig = GetCursorPos(out orig);
+        SetCursorPos(x, y);
+        mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
+        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+        if (hasOrig) { SetCursorPos(orig.X, orig.Y); }
+    }
+}
+"@
+
+$hint = $env:DINOBUDS_WS_HINT
+$proc = $null
+if ($hint) {
+    $proc = Get-Process | Where-Object {
+        $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*Antigravity*" -and $_.MainWindowTitle -like "*$hint*"
+    } | Select-Object -First 1
+}
+if (-not $proc) {
+    $proc = Get-Process | Where-Object {
+        $_.MainWindowHandle -ne 0 -and ($_.ProcessName -match "Antigravity" -or $_.MainWindowTitle -like "*Antigravity*")
+    } | Select-Object -First 1
+}
+if (-not $proc -or $proc.MainWindowHandle -eq 0) { exit 0 }
+
+$hwnd = $proc.MainWindowHandle
+if ([DinoResumeWin]::IsIconic($hwnd)) {
+    [void][DinoResumeWin]::ShowWindowAsync($hwnd, 9)
+    Start-Sleep -Milliseconds 60
+}
+[void][DinoResumeWin]::SetForegroundWindow($hwnd)
+Start-Sleep -Milliseconds 100
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+if (-not $root) { exit 0 }
+
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$phrases = @("submit", "allow", "accept", "continue", "retry", "run command", "run")
+foreach ($phrase in $phrases) {
+    foreach ($el in $all) {
+        try {
+            $ct = $el.Current.ControlType
+            if ($ct -ne [System.Windows.Automation.ControlType]::Button) { continue }
+            $rawName = $el.Current.Name
+            if (-not $rawName) { continue }
+            $trimmed = $rawName.Trim()
+            if ($trimmed.Length -eq 0 -or $trimmed.Length -gt 36) { continue }
+            if ($trimmed.ToLowerInvariant().Contains($phrase)) {
+                try {
+                    $inv = $null
+                    if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$inv)) {
+                        ([System.Windows.Automation.InvokePattern]$inv).Invoke()
+                        exit 0
+                    }
+                } catch {}
+                try {
+                    $rect = $el.Current.BoundingRectangle
+                    if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and -not [double]::IsInfinity($rect.Left)) {
+                        [DinoResumeWin]::ClickAt([int][Math]::Round($rect.Left + $rect.Width / 2.0), [int][Math]::Round($rect.Top + $rect.Height / 2.0))
+                        exit 0
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+}
+"#;
+            let _ = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    script,
+                ])
+                .env("DINOBUDS_WS_HINT", hint)
+                .creation_flags(0x08000000)
+                .spawn();
+        });
+    }
+}
+
 #[tauri::command]
 fn toggle_pause_session(
     id: String,
@@ -739,6 +896,7 @@ fn toggle_pause_session(
             }
         }
 
+        let mut launched_axiom = false;
         if id.starts_with("axiom-") {
             if let Some(ref session) = existing_session {
                 let run_id = session.name.clone();
@@ -748,37 +906,60 @@ fn toggle_pause_session(
 
                 #[cfg(target_os = "windows")]
                 if let (Some(model), Some(axiom_ws)) = (model_opt, axiom_ws_opt) {
-                    let ws_str = axiom_ws.to_string_lossy().to_string();
+                    launched_axiom = true;
+                    let resumed_ref = resumed_sessions.0.clone();
+                    let session_id = id.clone();
                     std::thread::spawn(move || {
-                        let script = r#"
-$runId = $env:DINOBUDS_RUN_ID
-$model = $env:DINOBUDS_MODEL
-$ws = $env:DINOBUDS_WS
-if (-not $runId -or -not $model -or -not $ws) { exit 0 }
-$running = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object {
-    $_.CommandLine -and $_.CommandLine -like "*--run-id*$runId*"
-} | Select-Object -First 1
-if (-not $running) {
-    Start-Process -FilePath "npx.cmd" -ArgumentList @("tsx", "src/eval/ablation-v3.ts", "--model", $model, "--run-id", $runId, "--allow-dirty") -WorkingDirectory $ws -WindowStyle Hidden
-}
-"#;
-                        let _ = Command::new("powershell.exe")
-                            .args([
-                                "-NoProfile",
-                                "-NonInteractive",
-                                "-WindowStyle",
-                                "Hidden",
-                                "-Command",
-                                script,
-                            ])
-                            .env("DINOBUDS_RUN_ID", run_id)
-                            .env("DINOBUDS_MODEL", model)
-                            .env("DINOBUDS_WS", ws_str)
-                            .creation_flags(0x08000000)
-                            .spawn();
+                        if has_live_axiom_process(&run_id) {
+                            return;
+                        }
+                        let log_path = get_user_profile_dir()
+                            .map(|h| h.join(".dinobuds").join("logs").join(format!("axiom-{}.log", sanitize_id(&run_id))));
+                        let mut cmd = Command::new("cmd.exe");
+                        cmd.args([
+                            "/C",
+                            "npx.cmd",
+                            "tsx",
+                            "src/eval/ablation-v3.ts",
+                            "--model",
+                            &model,
+                            "--run-id",
+                            &run_id,
+                            "--allow-dirty",
+                        ])
+                        .current_dir(&axiom_ws)
+                        .creation_flags(0x08000000);
+
+                        if let Some(ref lp) = log_path {
+                            if let Some(parent) = lp.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            if let Ok(file) = File::create(lp) {
+                                if let Ok(err_file) = file.try_clone() {
+                                    cmd.stdout(std::process::Stdio::from(file));
+                                    cmd.stderr(std::process::Stdio::from(err_file));
+                                }
+                            }
+                        }
+
+                        if let Ok(mut child) = cmd.spawn() {
+                            let _ = child.wait();
+                            let mut rmap = lock_or_recover(&resumed_ref);
+                            rmap.remove(&session_id);
+                        } else {
+                            let mut rmap = lock_or_recover(&resumed_ref);
+                            rmap.remove(&session_id);
+                        }
                     });
                 }
             }
+        }
+
+        if !launched_axiom {
+            let ws_hint = existing_session
+                .as_ref()
+                .and_then(|s| s.workspace_path.as_deref());
+            trigger_antigravity_resume_ui(ws_hint);
         }
     } else {
         {
@@ -3180,6 +3361,7 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
         convs.iter().map(|c| (c.id.clone(), c)).collect();
     let mut consumed_conv_ids: HashSet<String> = HashSet::new();
     let mut sessions: Vec<AgentSession> = Vec::new();
+    let live_axiom_runs = list_live_axiom_run_ids();
 
     for (_, mut rec) in benchmark_runs {
         let disk_or_log_mtime = rec.updated_at;
@@ -3263,6 +3445,7 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
         let last_active_write = disk_or_log_mtime.max(max_linked_log_mtime);
 
         if rec.current_step < rec.total_steps {
+            let is_live_process = live_axiom_runs.contains(&rec.name.to_lowercase());
             let has_live_approval = waiting_conv_question
                 .as_ref()
                 .map(|(wait_ts, _, _)| *wait_ts > ws_pause_ts && !conv_explicitly_paused)
@@ -3274,6 +3457,10 @@ fn scan_brain_and_axiom() -> Vec<AgentSession> {
                     rec.step_label = step_lbl;
                     rec.question = Some(q);
                 }
+            } else if is_live_process {
+                rec.status = "running".to_string();
+                rec.question = None;
+                rec.updated_at = rec.updated_at.max(now);
             } else if rec.current_step > 0
                 && (now.saturating_sub(last_active_write) > 30
                     || conv_explicitly_paused
