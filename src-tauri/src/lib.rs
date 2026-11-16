@@ -3877,11 +3877,21 @@ pub struct ShiftSession {
     #[serde(default)]
     pub app_minutes: HashMap<String, u32>,
     #[serde(default)]
+    pub app_durations: HashMap<String, u32>,
+    #[serde(default)]
     pub commit_evidence: Vec<GitCommitEvidence>,
     #[serde(default)]
     pub challenges: String,
     #[serde(default)]
     pub learnings: String,
+    #[serde(default)]
+    pub is_paused: bool,
+    #[serde(default)]
+    pub pause_started_ts: Option<u64>,
+    #[serde(default)]
+    pub total_paused_seconds: u64,
+    #[serde(default)]
+    pub break_logs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3908,6 +3918,8 @@ pub struct CompletedShift {
     #[serde(default)]
     pub app_breakdown: HashMap<String, u32>,
     #[serde(default)]
+    pub app_durations: HashMap<String, u32>,
+    #[serde(default)]
     pub commit_evidence: Vec<GitCommitEvidence>,
     #[serde(default)]
     pub challenges: String,
@@ -3915,6 +3927,10 @@ pub struct CompletedShift {
     pub learnings: String,
     #[serde(default)]
     pub verification_hash: String,
+    #[serde(default)]
+    pub total_paused_seconds: u64,
+    #[serde(default)]
+    pub break_logs: Vec<String>,
 }
 
 fn default_target_hours() -> f64 {
@@ -3995,6 +4011,7 @@ unsafe extern "system" {
     fn GetLastInputInfo(plii: *mut LastInputInfo) -> i32;
     fn GetForegroundWindow() -> isize;
     fn GetWindowTextW(h_wnd: isize, lp_string: *mut u16, n_max_count: i32) -> i32;
+    fn GetWindowThreadProcessId(h_wnd: isize, lpdw_process_id: *mut u32) -> u32;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4184,6 +4201,7 @@ fn capture_network_stamp() -> String {
                 let text = String::from_utf8_lossy(&output.stdout);
                 let mut connected = false;
                 let mut ssid: Option<String> = None;
+                let mut bssid: Option<String> = None;
                 for raw_line in text.lines() {
                     let line = raw_line.trim();
                     if let Some((key, val)) = line.split_once(':') {
@@ -4193,11 +4211,16 @@ fn capture_network_stamp() -> String {
                             connected = v.eq_ignore_ascii_case("connected");
                         } else if k.eq_ignore_ascii_case("SSID") && !v.is_empty() && v != "None" {
                             ssid = Some(v.to_string());
+                        } else if k.eq_ignore_ascii_case("BSSID") && !v.is_empty() && v != "None" {
+                            bssid = Some(v.to_string());
                         }
                     }
                 }
                 if let Some(name) = ssid {
                     if connected {
+                        if let Some(b) = bssid {
+                            return format!("Wi-Fi: {} (BSSID: {})", name, b);
+                        }
                         return format!("Wi-Fi: {}", name);
                     }
                 }
@@ -4212,60 +4235,135 @@ fn cached_startup_network_stamp() -> String {
     STARTUP_STAMP.get_or_init(capture_network_stamp).clone()
 }
 
-fn classify_active_app(title: &str) -> Option<String> {
-    let trimmed = title.trim();
-    if trimmed.is_empty() {
+fn extract_sanitized_doc_name(title: &str, suffixes: &[&str]) -> Option<String> {
+    let mut base = title.trim();
+    for suf in suffixes {
+        if let Some(stripped) = base.strip_suffix(suf) {
+            base = stripped.trim();
+            break;
+        }
+    }
+    if base.is_empty() || base.eq_ignore_ascii_case("Excel") || base.eq_ignore_ascii_case("Word") {
         return None;
     }
-    let lower = trimmed.to_lowercase();
-    if lower.contains("antigravity") {
-        return Some("Antigravity".to_string());
+    let filename = base
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(base)
+        .trim();
+    if filename.is_empty() {
+        None
+    } else {
+        Some(truncate_str(filename, 30))
     }
-    if lower.contains("visual studio code") || lower.ends_with(" - code") {
-        return Some("VS Code".to_string());
+}
+
+fn sanitize_app_and_doc_label(proc_name: &str, title: &str) -> Option<(String, String)> {
+    let p_lower = proc_name.trim().to_lowercase();
+    let t_lower = title.trim().to_lowercase();
+
+    if p_lower == "excel.exe" || t_lower.ends_with(" - excel") {
+        let doc = extract_sanitized_doc_name(title, &[" - Excel", " - Microsoft Excel"]);
+        let detail = match doc {
+            Some(d) => format!("Microsoft Excel — {}", d),
+            None => "Microsoft Excel (Data Encoding)".to_string(),
+        };
+        return Some(("Excel".to_string(), detail));
     }
-    if lower.contains("powershell")
-        || lower.contains("windows terminal")
-        || lower.contains("command prompt")
-        || lower.contains("cmd.exe")
-        || lower.contains("wezterm")
-        || lower.contains("alacritty")
+    if p_lower == "winword.exe" || t_lower.ends_with(" - word") {
+        let doc = extract_sanitized_doc_name(title, &[" - Word", " - Microsoft Word"]);
+        let detail = match doc {
+            Some(d) => format!("Microsoft Word — {}", d),
+            None => "Microsoft Word (Documentation)".to_string(),
+        };
+        return Some(("Word".to_string(), detail));
+    }
+    if p_lower == "powerpnt.exe" || t_lower.ends_with(" - powerpoint") {
+        let doc = extract_sanitized_doc_name(title, &[" - PowerPoint", " - Microsoft PowerPoint"]);
+        let detail = match doc {
+            Some(d) => format!("PowerPoint — {}", d),
+            None => "PowerPoint".to_string(),
+        };
+        return Some(("PowerPoint".to_string(), detail));
+    }
+    if p_lower == "acrord32.exe"
+        || p_lower == "acrobat.exe"
+        || p_lower.contains("foxit")
+        || t_lower.contains("adobe acrobat")
     {
-        return Some("Terminal".to_string());
+        let doc = extract_sanitized_doc_name(title, &[" - Adobe Acrobat Reader", " - Adobe Acrobat", " - Foxit PDF Reader"]);
+        let detail = match doc {
+            Some(d) => format!("PDF Reader — {}", d),
+            None => "PDF Reader".to_string(),
+        };
+        return Some(("PDF".to_string(), detail));
     }
-    if lower.contains("chrome")
-        || lower.contains("microsoft edge")
-        || lower.contains("firefox")
-        || lower.contains("brave")
-        || lower.contains("arc")
+    if p_lower == "chrome.exe" || t_lower.contains("google chrome") {
+        return Some(("Chrome".to_string(), "Google Chrome".to_string()));
+    }
+    if p_lower == "msedge.exe" || t_lower.contains("microsoft edge") {
+        return Some(("Edge".to_string(), "Microsoft Edge".to_string()));
+    }
+    if p_lower == "firefox.exe" || t_lower.contains("mozilla firefox") {
+        return Some(("Firefox".to_string(), "Firefox".to_string()));
+    }
+    if p_lower == "antigravity.exe" || t_lower.contains("antigravity") {
+        return Some(("Antigravity".to_string(), "Antigravity IDE".to_string()));
+    }
+    if p_lower == "code.exe" || t_lower.contains("visual studio code") || t_lower.ends_with(" - code") {
+        return Some(("VS Code".to_string(), "VS Code".to_string()));
+    }
+    if p_lower == "obsidian.exe" || t_lower.contains("obsidian") {
+        return Some(("Obsidian".to_string(), "Obsidian".to_string()));
+    }
+    if p_lower == "blender.exe" || t_lower.contains("blender") {
+        let doc = extract_sanitized_doc_name(title, &[" - Blender", "Blender"]);
+        let detail = match doc {
+            Some(d) => format!("Blender — {}", d),
+            None => "Blender".to_string(),
+        };
+        return Some(("Blender".to_string(), detail));
+    }
+    if p_lower == "figma.exe" || t_lower.contains("figma") {
+        return Some(("Figma".to_string(), "Figma".to_string()));
+    }
+    if p_lower == "windowsterminal.exe"
+        || p_lower == "powershell.exe"
+        || p_lower == "pwsh.exe"
+        || p_lower == "cmd.exe"
+        || t_lower.contains("powershell")
+        || t_lower.contains("windows terminal")
+        || t_lower.contains("command prompt")
     {
-        return Some("Browser".to_string());
+        return Some(("Terminal".to_string(), "Terminal".to_string()));
     }
-    if lower.contains("obsidian") {
-        return Some("Obsidian".to_string());
+    if p_lower == "dinobuds.exe" || t_lower.contains("dinobuds") || t_lower.contains("ojtpulse") {
+        return Some(("DinoBuds".to_string(), "DinoBuds".to_string()));
     }
-    if lower.contains("blender") {
-        return Some("Blender".to_string());
+
+    let clean_proc = proc_name
+        .trim()
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE");
+    if !clean_proc.is_empty() {
+        let label = truncate_str(clean_proc, 24);
+        return Some((label.clone(), label));
     }
-    if lower.contains("figma") {
-        return Some("Figma".to_string());
-    }
-    if lower.contains("dinobuds") || lower.contains("ojtpulse") {
-        return Some("DinoBuds".to_string());
-    }
-    let app_tail = trimmed
+    let app_tail = title
+        .trim()
         .rsplit(" - ")
         .next()
-        .unwrap_or(trimmed)
+        .unwrap_or("")
         .trim();
     if app_tail.is_empty() {
         None
     } else {
-        Some(truncate_str(app_tail, 24))
+        let label = truncate_str(app_tail, 24);
+        Some((label.clone(), label))
     }
 }
 
-fn sample_user_activity() -> (bool, Option<String>) {
+fn sample_user_activity() -> (bool, Option<(String, String)>) {
     #[cfg(target_os = "windows")]
     {
         let mut lii = LastInputInfo {
@@ -4284,12 +4382,32 @@ fn sample_user_activity() -> (bool, Option<String>) {
         let app_label = if hwnd != 0 {
             let mut buf = [0u16; 512];
             let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-            if len > 0 {
-                let title = String::from_utf16_lossy(&buf[..len as usize]);
-                classify_active_app(&title)
+            let title = if len > 0 {
+                String::from_utf16_lossy(&buf[..len as usize])
             } else {
-                None
+                String::new()
+            };
+
+            let mut pid = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(hwnd, &mut pid);
             }
+            let proc_name = if pid != 0 {
+                let mut sys = System::new();
+                let target_pid = Pid::from_u32(pid);
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[target_pid]),
+                    false,
+                    ProcessRefreshKind::nothing(),
+                );
+                sys.process(target_pid)
+                    .map(|p| p.name().to_string_lossy().to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            sanitize_app_and_doc_label(&proc_name, &title)
         } else {
             None
         };
@@ -4558,12 +4676,149 @@ fn format_commit_bullet(ev: &GitCommitEvidence) -> String {
     }
 }
 
+fn format_local_hm_for_ts(ts: u64) -> String {
+    let clock = current_local_clock();
+    let delta = clock.unix_secs.saturating_sub(ts) as i64;
+    let now_day_secs = (clock.hour as i64) * 3600 + (clock.minute as i64) * 60;
+    let target_secs = (now_day_secs - delta).rem_euclid(86_400);
+    let h = target_secs / 3600;
+    let m = (target_secs % 3600) / 60;
+    format!("{:02}:{:02}", h, m)
+}
+
+fn format_12h_for_ts(ts: u64) -> String {
+    let clock = current_local_clock();
+    let delta = clock.unix_secs.saturating_sub(ts) as i64;
+    let now_day_secs = (clock.hour as i64) * 3600 + (clock.minute as i64) * 60;
+    let target_secs = (now_day_secs - delta).rem_euclid(86_400);
+    let h24 = (target_secs / 3600) as u32;
+    let m = ((target_secs % 3600) / 60) as u32;
+    let ampm = if h24 >= 12 { "PM" } else { "AM" };
+    let h12 = match h24 % 12 {
+        0 => 12,
+        v => v,
+    };
+    format!("{:02}:{:02} {}", h12, m, ampm)
+}
+
+fn format_break_duration_label(secs: u64) -> String {
+    let mins = (secs / 60).max(if secs > 0 { 1 } else { 0 });
+    if mins >= 60 {
+        format!("{}h {:02}m", mins / 60, mins % 60)
+    } else {
+        format!("{}m", mins)
+    }
+}
+
+fn collect_modified_docs_in_dir(
+    dir: &Path,
+    since_ts: u64,
+    depth: u8,
+    out: &mut Vec<(u64, String, &'static str)>,
+) {
+    if depth > 3 || !dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= 80 {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            let lower = name.to_lowercase();
+            if name.starts_with('.')
+                || matches!(
+                    lower.as_str(),
+                    "node_modules" | "target" | ".git" | ".venv" | "dist" | "build" | "__pycache__"
+                )
+            {
+                continue;
+            }
+            collect_modified_docs_in_dir(&path, since_ts, depth + 1, out);
+            continue;
+        }
+        if name.starts_with("~$") || name.starts_with('.') {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        let kind: &'static str = match ext.as_str() {
+            "xlsx" | "xls" => "Excel spreadsheet",
+            "csv" => "CSV dataset",
+            "docx" => "Word document",
+            "pdf" => "PDF document",
+            "pptx" => "PowerPoint deck",
+            "blend" => "Blender project",
+            _ => continue,
+        };
+        let mtime = file_mtime_secs(&path);
+        if mtime >= since_ts {
+            out.push((mtime, name, kind));
+        }
+    }
+}
+
+fn scan_local_document_saves(watched_repos: &[String], since_ts: u64) -> Vec<String> {
+    let mut scan_roots: Vec<PathBuf> = Vec::new();
+    let mut seen_roots: HashSet<String> = HashSet::new();
+
+    if let Some(home) = get_user_profile_dir() {
+        for sub in ["Documents", "Desktop"] {
+            let p = home.join(sub);
+            if p.is_dir() && seen_roots.insert(p.to_string_lossy().to_lowercase()) {
+                scan_roots.push(p);
+            }
+        }
+    }
+    for repo in watched_repos {
+        let trimmed = repo.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_dir() && seen_roots.insert(p.to_string_lossy().to_lowercase()) {
+                scan_roots.push(p);
+            }
+        }
+    }
+
+    let mut raw_docs: Vec<(u64, String, &'static str)> = Vec::new();
+    for root in scan_roots {
+        collect_modified_docs_in_dir(&root, since_ts, 0, &mut raw_docs);
+    }
+    raw_docs.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut bullets: Vec<String> = Vec::new();
+    for (mtime, name, kind) in raw_docs {
+        if !seen_names.insert(name.to_lowercase()) {
+            continue;
+        }
+        let hm = format_local_hm_for_ts(mtime);
+        bullets.push(format!("[{}] [Document Updated] {} ({})", hm, name, kind));
+        if bullets.len() >= 20 {
+            break;
+        }
+    }
+    bullets
+}
+
 fn scan_git_and_agent_activities(
     watched_repos: &[String],
+    since_ts: u64,
 ) -> (Vec<String>, Vec<GitCommitEvidence>) {
     let mut found: Vec<String> = Vec::new();
     let mut commits: Vec<GitCommitEvidence> = Vec::new();
     let now = now_secs();
+
+    for doc_bullet in scan_local_document_saves(watched_repos, since_ts) {
+        push_unique_activity(&mut found, doc_bullet);
+    }
 
     for repo_raw in watched_repos {
         let repo = repo_raw.trim();
@@ -4714,17 +4969,17 @@ fn scan_git_and_agent_activities(
 fn spawn_ojt_pow_watcher(ojt_state: SharedOjtState) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
-        let (has_active, needs_net) = {
+        let (should_sample, needs_net) = {
             let state = lock_or_recover(&ojt_state);
             match state.active_shift {
-                Some(ref s) => (
+                Some(ref s) if !s.is_paused => (
                     true,
                     s.network_stamp.as_deref().unwrap_or("").trim().is_empty(),
                 ),
-                None => (false, false),
+                _ => (false, false),
             }
         };
-        if !has_active {
+        if !should_sample {
             continue;
         }
         let (is_active, app_opt) = sample_user_activity();
@@ -4736,10 +4991,14 @@ fn spawn_ojt_pow_watcher(ojt_state: SharedOjtState) {
 
         let mut state = lock_or_recover(&ojt_state);
         if let Some(ref mut shift) = state.active_shift {
+            if shift.is_paused {
+                continue;
+            }
             if is_active {
                 shift.active_minutes += 1;
-                if let Some(app) = app_opt {
-                    *shift.app_minutes.entry(app).or_insert(0) += 1;
+                if let Some((broad_app, detailed_label)) = app_opt {
+                    *shift.app_minutes.entry(broad_app).or_insert(0) += 1;
+                    *shift.app_durations.entry(detailed_label).or_insert(0) += 1;
                 }
             } else {
                 shift.idle_minutes += 1;
@@ -4798,14 +5057,23 @@ fn get_ojt_state(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
 
 #[tauri::command]
 fn scan_today_activity(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
-    let today = format_date(current_local_clock());
-    let repos = {
+    let clock = current_local_clock();
+    let today = format_date(clock);
+    let (repos, since_ts) = {
         let mut state = lock_or_recover(&ojt);
         reconcile_ojt_day(&mut state, &today);
-        state.watched_repos.clone()
+        let fallback_midnight = clock
+            .unix_secs
+            .saturating_sub((clock.hour as u64) * 3600 + (clock.minute as u64) * 60);
+        let since = state
+            .active_shift
+            .as_ref()
+            .map(|s| s.start_ts)
+            .unwrap_or(fallback_midnight);
+        (state.watched_repos.clone(), since)
     };
 
-    let (discovered, discovered_commits) = scan_git_and_agent_activities(&repos);
+    let (discovered, discovered_commits) = scan_git_and_agent_activities(&repos, since_ts);
 
     let mut state = lock_or_recover(&ojt);
     reconcile_ojt_day(&mut state, &today);
@@ -4865,6 +5133,37 @@ fn update_today_reflections(
 }
 
 #[tauri::command]
+fn toggle_shift_break(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
+    let clock = current_local_clock();
+    let today = format_date(clock);
+    let mut state = lock_or_recover(&ojt);
+    reconcile_ojt_day(&mut state, &today);
+
+    if let Some(ref mut shift) = state.active_shift {
+        if shift.is_paused {
+            let start_break = shift.pause_started_ts.unwrap_or(clock.unix_secs);
+            let elapsed_break = clock.unix_secs.saturating_sub(start_break);
+            shift.total_paused_seconds = shift.total_paused_seconds.saturating_add(elapsed_break);
+            let log_entry = format!(
+                "{} - {} ({} break)",
+                format_12h_for_ts(start_break),
+                format_12h_for_ts(clock.unix_secs),
+                format_break_duration_label(elapsed_break)
+            );
+            shift.break_logs.push(log_entry);
+            shift.is_paused = false;
+            shift.pause_started_ts = None;
+        } else {
+            shift.is_paused = true;
+            shift.pause_started_ts = Some(clock.unix_secs);
+        }
+        save_ojt_state(&state);
+    }
+
+    build_ojt_dashboard(&state)
+}
+
+#[tauri::command]
 fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
     let clock = current_local_clock();
     let today = format_date(clock);
@@ -4876,12 +5175,31 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
         (state.active_shift.clone(), state.watched_repos.clone())
     };
 
-    if let Some(shift) = active_opt {
-        let (discovered, discovered_commits) = scan_git_and_agent_activities(&repos);
+    if let Some(mut shift) = active_opt {
+        let (discovered, discovered_commits) =
+            scan_git_and_agent_activities(&repos, shift.start_ts);
         let net_out = capture_network_stamp();
 
         let mut state = lock_or_recover(&ojt);
         reconcile_ojt_day(&mut state, &today);
+
+        if let Some(ref current_active) = state.active_shift {
+            shift = current_active.clone();
+        }
+        if shift.is_paused {
+            let start_break = shift.pause_started_ts.unwrap_or(clock.unix_secs);
+            let elapsed_break = clock.unix_secs.saturating_sub(start_break);
+            shift.total_paused_seconds = shift.total_paused_seconds.saturating_add(elapsed_break);
+            let log_entry = format!(
+                "{} - {} ({} break)",
+                format_12h_for_ts(start_break),
+                format_12h_for_ts(clock.unix_secs),
+                format_break_duration_label(elapsed_break)
+            );
+            shift.break_logs.push(log_entry);
+            shift.is_paused = false;
+            shift.pause_started_ts = None;
+        }
 
         for item in discovered {
             push_unique_activity(&mut state.today_activities, item);
@@ -4913,8 +5231,11 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             shift.learnings.trim().to_string()
         };
 
-        let elapsed = clock.unix_secs.saturating_sub(shift.start_ts) as f64;
-        let duration_hours = round_two_decimals(elapsed / 3600.0).max(0.01);
+        let net_elapsed = clock
+            .unix_secs
+            .saturating_sub(shift.start_ts)
+            .saturating_sub(shift.total_paused_seconds) as f64;
+        let duration_hours = round_two_decimals(net_elapsed / 3600.0).max(0.01);
 
         let total_tracked = shift.active_minutes + shift.idle_minutes;
         let focus_percent = if total_tracked > 0 {
@@ -4968,10 +5289,13 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             network_stamp_in: Some(net_in),
             network_stamp_out: Some(net_out),
             app_breakdown: shift.app_minutes,
+            app_durations: shift.app_durations,
             commit_evidence,
             challenges,
             learnings,
             verification_hash,
+            total_paused_seconds: shift.total_paused_seconds,
+            break_logs: shift.break_logs,
         };
         state.completed_shifts.insert(0, completed);
         state.active_shift = None;
@@ -4990,9 +5314,14 @@ fn toggle_shift(ojt: State<'_, SharedOjtState>) -> OjtDashboardResponse {
             idle_minutes: 0,
             network_stamp: Some(net_in),
             app_minutes: HashMap::new(),
+            app_durations: HashMap::new(),
             commit_evidence: state.today_commits.clone(),
             challenges: state.today_challenges.clone(),
             learnings: state.today_learnings.clone(),
+            is_paused: false,
+            pause_started_ts: None,
+            total_paused_seconds: 0,
+            break_logs: Vec::new(),
         });
         save_ojt_state(&state);
         build_ojt_dashboard(&state)
@@ -5044,6 +5373,24 @@ fn format_tools_summary(app_map: &HashMap<String, u32>) -> String {
     }
 }
 
+fn format_app_durations_summary(app_map: &HashMap<String, u32>) -> String {
+    let top = top_apps_sorted(app_map, 8);
+    if top.is_empty() {
+        "_No application focus data captured yet._".to_string()
+    } else {
+        top.into_iter()
+            .map(|(name, mins)| {
+                if mins >= 60 {
+                    format!("{}: {:.1} hrs", name, (mins as f64) / 60.0)
+                } else {
+                    format!("{}: {}m", name, mins)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
 fn build_daily_markdown(today: &str, dash: &OjtDashboardResponse) -> String {
     let mut today_shifts: Vec<&CompletedShift> = dash
         .completed_shifts
@@ -5055,10 +5402,23 @@ fn build_daily_markdown(today: &str, dash: &OjtDashboardResponse) -> String {
     let mut active_m: u32 = today_shifts.iter().map(|s| s.active_minutes).sum();
     let mut idle_m: u32 = today_shifts.iter().map(|s| s.idle_minutes).sum();
     let mut app_totals: HashMap<String, u32> = HashMap::new();
+    let mut doc_app_totals: HashMap<String, u32> = HashMap::new();
+    let mut total_break_secs: u64 = today_shifts.iter().map(|s| s.total_paused_seconds).sum();
+    let mut all_break_logs: Vec<String> = Vec::new();
+
     for s in &today_shifts {
         for (app, mins) in &s.app_breakdown {
             *app_totals.entry(app.clone()).or_insert(0) += *mins;
         }
+        let dur_src = if s.app_durations.is_empty() {
+            &s.app_breakdown
+        } else {
+            &s.app_durations
+        };
+        for (app, mins) in dur_src {
+            *doc_app_totals.entry(app.clone()).or_insert(0) += *mins;
+        }
+        all_break_logs.extend(s.break_logs.iter().cloned());
     }
 
     let mut rendered_today: f64 = today_shifts.iter().map(|s| s.duration_hours).sum();
@@ -5069,18 +5429,44 @@ fn build_daily_markdown(today: &str, dash: &OjtDashboardResponse) -> String {
             for (app, mins) in &active.app_minutes {
                 *app_totals.entry(app.clone()).or_insert(0) += *mins;
             }
-            let elapsed_hrs =
-                round_two_decimals(now_secs().saturating_sub(active.start_ts) as f64 / 3600.0);
+            let dur_src = if active.app_durations.is_empty() {
+                &active.app_minutes
+            } else {
+                &active.app_durations
+            };
+            for (app, mins) in dur_src {
+                *doc_app_totals.entry(app.clone()).or_insert(0) += *mins;
+            }
+            let now = now_secs();
+            let ongoing_pause = if active.is_paused {
+                now.saturating_sub(active.pause_started_ts.unwrap_or(now))
+            } else {
+                0
+            };
+            let active_pause_secs = active.total_paused_seconds.saturating_add(ongoing_pause);
+            total_break_secs = total_break_secs.saturating_add(active_pause_secs);
+            all_break_logs.extend(active.break_logs.iter().cloned());
+
+            let net_secs = now
+                .saturating_sub(active.start_ts)
+                .saturating_sub(active_pause_secs);
+            let elapsed_hrs = round_two_decimals(net_secs as f64 / 3600.0);
             rendered_today = round_two_decimals(rendered_today + elapsed_hrs);
         }
     }
 
+    let break_suffix = if total_break_secs >= 60 {
+        format!(" ({} break) → {:.2} hrs net", format_break_duration_label(total_break_secs), rendered_today)
+    } else {
+        String::new()
+    };
+
     let shift_window = match (today_shifts.first(), today_shifts.last(), &dash.active_shift) {
         (Some(first), Some(_), Some(active)) if active.date_str == today => {
-            format!("{} – Active ({}+)", first.time_in, active.time_in_str)
+            format!("{} – Active ({}+){}", first.time_in, active.time_in_str, break_suffix)
         }
-        (Some(first), Some(last), _) => format!("{} – {}", first.time_in, last.time_out),
-        (None, None, Some(active)) => format!("{} – In Progress", active.time_in_str),
+        (Some(first), Some(last), _) => format!("{} – {}{}", first.time_in, last.time_out, break_suffix),
+        (None, None, Some(active)) => format!("{} – In Progress{}", active.time_in_str, break_suffix),
         _ => "No shift clocked today".to_string(),
     };
 
@@ -5195,7 +5581,14 @@ fn build_daily_markdown(today: &str, dash: &OjtDashboardResponse) -> String {
         focus_pct, active_m, idle_m, tools_summary
     ));
     md.push_str(&format!("- **Network / Workstation Stamp:** {}\n", net_stamp));
-    md.push_str(&format!("- **Shift Verification ID:** `{}`\n\n", verification_id));
+    md.push_str(&format!("- **Shift Verification ID:** `{}`\n", verification_id));
+    if !all_break_logs.is_empty() {
+        md.push_str(&format!("- **Break / Lunch Deductions:** {}\n", all_break_logs.join("; ")));
+    }
+    md.push('\n');
+
+    md.push_str("## Work & Application Breakdown\n\n");
+    md.push_str(&format!("{}\n\n", format_app_durations_summary(&doc_app_totals)));
 
     md.push_str("## Verified Git Commit & File Evidence\n\n");
     if commits.is_empty() {
@@ -5280,12 +5673,17 @@ fn build_weekly_journal_markdown(
     ));
 
     md.push_str("## 1. Weekly DTR Attendance Table\n\n");
-    md.push_str("| Date | Time In | Time Out | Active Ratio | Hours | Verification ID |\n");
-    md.push_str("| --- | --- | --- | ---: | ---: | --- |\n");
+    md.push_str("| Date | Time In | Time Out | Breaks | Active Ratio | Net Hours | Verification ID |\n");
+    md.push_str("| --- | --- | --- | --- | ---: | ---: | --- |\n");
     if shifts.is_empty() {
-        md.push_str("| - | - | - | - | 0.00 | No completed shifts in selected period |\n");
+        md.push_str("| - | - | - | - | - | 0.00 | No completed shifts in selected period |\n");
     } else {
         for s in &shifts {
+            let break_cell = if s.total_paused_seconds >= 60 {
+                format_break_duration_label(s.total_paused_seconds)
+            } else {
+                "-".to_string()
+            };
             let ratio_str = if s.active_minutes + s.idle_minutes > 0 {
                 format!("{:.1}% ({}m/{}m)", s.focus_percent, s.active_minutes, s.active_minutes + s.idle_minutes)
             } else {
@@ -5304,8 +5702,8 @@ fn build_weekly_journal_markdown(
                 s.verification_hash.clone()
             };
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {:.2} | `{}` |\n",
-                s.date_str, s.time_in, s.time_out, ratio_str, s.duration_hours, ver_id
+                "| {} | {} | {} | {} | {} | {:.2} | `{}` |\n",
+                s.date_str, s.time_in, s.time_out, break_cell, ratio_str, s.duration_hours, ver_id
             ));
         }
     }
@@ -5329,14 +5727,28 @@ fn build_weekly_journal_markdown(
 
     let mut days: std::collections::BTreeMap<String, DayBucket> = std::collections::BTreeMap::new();
     let mut period_app_totals: HashMap<String, u32> = HashMap::new();
+    let mut period_doc_app_totals: HashMap<String, u32> = HashMap::new();
     let mut unique_repos: HashSet<String> = HashSet::new();
     let mut total_commits_logged = 0usize;
 
     for s in &shifts {
         let entry = days.entry(s.date_str.clone()).or_default();
+        let brk_note = if s.total_paused_seconds >= 60 {
+            format!(" ({} break)", format_break_duration_label(s.total_paused_seconds))
+        } else {
+            String::new()
+        };
         entry
             .windows
-            .push(format!("{}–{} ({:.2}h)", s.time_in, s.time_out, s.duration_hours));
+            .push(format!("{}–{}{} ({:.2}h net)", s.time_in, s.time_out, brk_note, s.duration_hours));
+        let dur_src = if s.app_durations.is_empty() {
+            &s.app_breakdown
+        } else {
+            &s.app_durations
+        };
+        for (app, mins) in dur_src {
+            *period_doc_app_totals.entry(app.clone()).or_insert(0) += *mins;
+        }
         if let Some(ref net) = s.network_stamp_in {
             push_unique_activity(&mut entry.net_stamps, net.clone());
         }
@@ -5378,6 +5790,14 @@ fn build_weekly_journal_markdown(
             entry.idle_m += active.idle_minutes;
             for (app, mins) in &active.app_minutes {
                 *period_app_totals.entry(app.clone()).or_insert(0) += *mins;
+            }
+            let dur_src = if active.app_durations.is_empty() {
+                &active.app_minutes
+            } else {
+                &active.app_durations
+            };
+            for (app, mins) in dur_src {
+                *period_doc_app_totals.entry(app.clone()).or_insert(0) += *mins;
             }
         }
         merge_commit_evidence(&mut entry.commits, &dash.today_commits);
@@ -5496,6 +5916,11 @@ fn build_weekly_journal_markdown(
         0.0
     };
     let tools_summary = format_tools_summary(&period_app_totals);
+
+    let doc_breakdown_summary = format_app_durations_summary(&period_doc_app_totals);
+
+    md.push_str("## Work & Application Breakdown\n\n");
+    md.push_str(&format!("{}\n\n", doc_breakdown_summary));
 
     md.push_str("## 4. Weekly Learning Synthesis & Coordinator Verification\n\n");
     md.push_str(&format!(
@@ -5628,6 +6053,7 @@ pub fn run() {
             sweep_orphan_node,
             get_ojt_state,
             toggle_shift,
+            toggle_shift_break,
             update_ojt_settings,
             scan_today_activity,
             add_manual_activity,

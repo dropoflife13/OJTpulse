@@ -61,9 +61,14 @@ interface ShiftSession {
   idle_minutes: number;
   network_stamp?: string | null;
   app_minutes: Record<string, number>;
+  app_durations?: Record<string, number>;
   commit_evidence: GitCommitEvidence[];
   challenges: string;
   learnings: string;
+  is_paused?: boolean;
+  pause_started_ts?: number | null;
+  total_paused_seconds?: number;
+  break_logs?: string[];
 }
 
 interface CompletedShift {
@@ -80,10 +85,22 @@ interface CompletedShift {
   network_stamp_in?: string | null;
   network_stamp_out?: string | null;
   app_breakdown: Record<string, number>;
+  app_durations?: Record<string, number>;
   commit_evidence: GitCommitEvidence[];
   challenges: string;
   learnings: string;
   verification_hash: string;
+  total_paused_seconds?: number;
+  break_logs?: string[];
+}
+
+function formatMinutesCompact(mins: number): string {
+  if (mins >= 60) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  return `${mins}m`;
 }
 
 interface OjtDashboardResponse {
@@ -524,6 +541,8 @@ export default function App() {
   const [ojtBanner, setOjtBanner] = useState<string | null>(null);
   const [isSyncingOjt, setIsSyncingOjt] = useState(false);
   const [shiftElapsedSecs, setShiftElapsedSecs] = useState(0);
+  const [breakElapsedSecs, setBreakElapsedSecs] = useState(0);
+  const manualNoteInputRef = useRef<HTMLInputElement | null>(null);
   const [targetHoursInput, setTargetHoursInput] = useState("486");
   const [reposInput, setReposInput] = useState("");
   const [exportDirInput, setExportDirInput] = useState("");
@@ -557,18 +576,34 @@ export default function App() {
   };
 
   useEffect(() => {
-    const startTs = ojt?.active_shift?.start_ts;
-    if (!startTs) {
+    const active = ojt?.active_shift;
+    if (!active) {
       setShiftElapsedSecs(0);
+      setBreakElapsedSecs(0);
       return;
     }
     const updateTick = () => {
-      setShiftElapsedSecs(Math.max(0, Math.floor(Date.now() / 1000) - startTs));
+      const nowSec = Math.floor(Date.now() / 1000);
+      const totalPaused = active.total_paused_seconds ?? 0;
+      if (active.is_paused) {
+        const pauseStart = active.pause_started_ts ?? nowSec;
+        const netAtPause = Math.max(0, pauseStart - active.start_ts - totalPaused);
+        setShiftElapsedSecs(netAtPause);
+        setBreakElapsedSecs(Math.max(0, nowSec - pauseStart));
+      } else {
+        setShiftElapsedSecs(Math.max(0, nowSec - active.start_ts - totalPaused));
+        setBreakElapsedSecs(0);
+      }
     };
     updateTick();
     const timer = setInterval(updateTick, 1000);
     return () => clearInterval(timer);
-  }, [ojt?.active_shift?.start_ts]);
+  }, [
+    ojt?.active_shift?.start_ts,
+    ojt?.active_shift?.is_paused,
+    ojt?.active_shift?.pause_started_ts,
+    ojt?.active_shift?.total_paused_seconds,
+  ]);
 
   const fetchHealth = async () => {
     setIsRefreshingHealth(true);
@@ -793,6 +828,27 @@ export default function App() {
     } catch (err) {
       showOjtBanner(`Shift update failed: ${String(err)}`);
     }
+  };
+
+  const handleToggleShiftBreak = async () => {
+    try {
+      const wasPaused = Boolean(ojt?.active_shift?.is_paused);
+      const res = await invoke<OjtDashboardResponse>("toggle_shift_break");
+      applyOjtResponse(res);
+      showOjtBanner(
+        wasPaused ? "Back on duty — break deducted from DTR." : "On Lunch / Break — timer & heartbeat paused."
+      );
+    } catch (err) {
+      showOjtBanner(`Break toggle failed: ${String(err)}`);
+    }
+  };
+
+  const handleSelectCategoryPill = (tag: string) => {
+    setManualNote((prev) => {
+      const cleaned = prev.replace(/^\[[^\]]+\]\s*/, "").trimStart();
+      return `[${tag}] ${cleaned}`;
+    });
+    setTimeout(() => manualNoteInputRef.current?.focus(), 0);
   };
 
   const handleScanActivity = async () => {
@@ -1020,11 +1076,25 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab("ojt")}
-              title={`Active OJT shift started @ ${ojt.active_shift.time_in_str}`}
-              className="pointer-events-auto flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono font-semibold shrink-0 cursor-pointer hover:bg-emerald-500/25 transition-colors"
+              title={
+                ojt.active_shift.is_paused
+                  ? `On Lunch / Break (Shift started @ ${ojt.active_shift.time_in_str})`
+                  : `Active OJT shift started @ ${ojt.active_shift.time_in_str}`
+              }
+              className={`pointer-events-auto flex items-center gap-1 px-1.5 py-0.5 rounded-full border text-[10px] font-mono font-semibold shrink-0 cursor-pointer transition-colors ${
+                ojt.active_shift.is_paused
+                  ? "bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
+                  : "bg-emerald-500/15 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25"
+              }`}
             >
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              {formatElapsedHms(shiftElapsedSecs)}
+              <span
+                className={`w-1.5 h-1.5 rounded-full animate-pulse ${
+                  ojt.active_shift.is_paused ? "bg-amber-400" : "bg-emerald-400"
+                }`}
+              />
+              {ojt.active_shift.is_paused
+                ? `BREAK ${formatElapsedHms(breakElapsedSecs)}`
+                : formatElapsedHms(shiftElapsedSecs)}
             </button>
           )}
         </div>
@@ -1631,28 +1701,59 @@ export default function App() {
               <span>Est: {ojt?.estimated_completion_date ?? "Calculating..."}</span>
             </div>
 
-            <button
-              type="button"
-              onClick={handleToggleShift}
-              className={`ui-chrome w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
-                ojt?.active_shift
-                  ? "bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border-rose-500/40"
-                  : "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-500/40"
-              }`}
-            >
-              {ojt?.active_shift ? (
-                <>
-                  <Square className="w-3.5 h-3.5 fill-current" />
-                  Time Out &bull; {formatElapsedHms(shiftElapsedSecs)} (In @{" "}
-                  {ojt.active_shift.time_in_str})
-                </>
-              ) : (
-                <>
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  Time In &mdash; Start OJT Shift
-                </>
-              )}
-            </button>
+            {ojt?.active_shift ? (
+              <div className="space-y-1.5">
+                {ojt.active_shift.is_paused && (
+                  <div className="flex items-center justify-between px-2 py-1 rounded-lg bg-amber-500/15 border border-amber-500/35 text-[10px] font-mono text-amber-200">
+                    <span className="font-bold tracking-wider">ON BREAK</span>
+                    <span>
+                      {formatElapsedHms(breakElapsedSecs)} (Duty: {formatElapsedHms(shiftElapsedSecs)})
+                    </span>
+                  </div>
+                )}
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleToggleShiftBreak}
+                    className={`ui-chrome flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                      ojt.active_shift.is_paused
+                        ? "bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/40"
+                        : "bg-zinc-800 hover:bg-zinc-700 text-zinc-100 border-zinc-700/80"
+                    }`}
+                  >
+                    {ojt.active_shift.is_paused ? (
+                      <>
+                        <Play className="w-3 h-3 fill-current" />
+                        Resume Duty
+                      </>
+                    ) : (
+                      <>
+                        <Pause className="w-3 h-3" />
+                        Lunch / Break
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleToggleShift}
+                    title={`Clock out (In @ ${ojt.active_shift.time_in_str})`}
+                    className="ui-chrome flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border-rose-500/40"
+                  >
+                    <Square className="w-3 h-3 fill-current" />
+                    Time Out &bull; {formatElapsedHms(shiftElapsedSecs)}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleToggleShift}
+                className="ui-chrome w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-500/40"
+              >
+                <Play className="w-3.5 h-3.5 fill-current" />
+                Time In &mdash; Start OJT Shift
+              </button>
+            )}
 
             {/* Live Proof-of-Work Telemetry Strip */}
             <div className="rounded-lg p-1.5 bg-zinc-950/80 border border-zinc-800/80 space-y-1">
@@ -1695,10 +1796,9 @@ export default function App() {
 
               {ojt && ojt.top_active_apps.length > 0 && (
                 <div className="text-[9.5px] text-zinc-400 truncate px-0.5 font-mono">
-                  Tools:{" "}
                   {ojt.top_active_apps
-                    .map(([app, mins]) => `${app} (${mins}m)`)
-                    .join(" · ")}
+                    .map(([app, mins]) => `${app} ${formatMinutesCompact(mins)}`)
+                    .join(" • ")}
                 </div>
               )}
             </div>
@@ -1758,7 +1858,7 @@ export default function App() {
                 <RefreshCw
                   className={`w-3 h-3 ${isSyncingOjt ? "animate-spin" : ""}`}
                 />
-                Sync Git Commits &amp; Agent Tasks
+                Sync Docs, Git &amp; Agent Tasks
               </button>
 
               <div className="grid grid-cols-2 gap-1.5">
@@ -1814,8 +1914,29 @@ export default function App() {
                 </div>
               )}
 
+              {/* 1-Click Office/IT Work Category Pills */}
+              <div className="flex flex-wrap items-center gap-1">
+                {[
+                  "Data Entry",
+                  "Docs / Reports",
+                  "IT Support",
+                  "UI / Design",
+                  "Briefing",
+                ].map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => handleSelectCategoryPill(cat)}
+                    className="ui-chrome px-1.5 py-0.5 rounded-md bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-amber-200 border border-zinc-800 hover:border-amber-500/40 text-[9.5px] font-medium transition-colors cursor-pointer"
+                  >
+                    + {cat}
+                  </button>
+                ))}
+              </div>
+
               <form onSubmit={handleAddManualActivity} className="flex items-center gap-1.5">
                 <input
+                  ref={manualNoteInputRef}
                   type="text"
                   value={manualNote}
                   onChange={(e) => setManualNote(e.target.value)}
