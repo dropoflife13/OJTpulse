@@ -176,7 +176,9 @@ fn reconcile_and_emit(
                     };
                 }
             } else if let Some(&resumed_at) = resumed_map.get(&session.id) {
-                if now.saturating_sub(resumed_at) <= 25 && session.status == "paused" {
+                if now.saturating_sub(resumed_at) <= 25
+                    && (session.status == "paused" || session.status == "waiting_permission")
+                {
                     session.status = "running".to_string();
                     session.question = None;
                     session.step_label = "Resuming checkpoint...".to_string();
@@ -188,24 +190,29 @@ fn reconcile_and_emit(
             if session.status != "paused" {
                 if let Some(&(action_ts, was_approved)) = approved_map.get(&session.id) {
                     if was_approved {
-                        if now.saturating_sub(action_ts) <= 4
+                        if now.saturating_sub(action_ts) <= 18
                             && session.status == "waiting_permission"
                         {
                             session.status = "running".to_string();
                             session.question = None;
                             session.decision = Some(true);
                             session.step_label = "Submitted ⏎".to_string();
-                        } else if now.saturating_sub(action_ts) > 4 {
+                        } else if now.saturating_sub(action_ts) > 18
+                            || session.updated_at > action_ts + 2
+                        {
                             approved_map.remove(&session.id);
                         }
-                    } else if session.updated_at <= action_ts
+                    } else if now.saturating_sub(action_ts) <= 18
+                        && session.updated_at <= action_ts + 2
                         && session.status == "waiting_permission"
                     {
                         session.status = "done".to_string();
                         session.question = None;
                         session.decision = Some(false);
                         session.step_label = "Skipped".to_string();
-                    } else if session.updated_at > action_ts {
+                    } else if now.saturating_sub(action_ts) > 18
+                        || session.updated_at > action_ts + 2
+                    {
                         approved_map.remove(&session.id);
                     }
                 }
@@ -340,11 +347,24 @@ fn submit_agent_prompt(
     approved: bool,
     state: State<'_, SharedSessions>,
     manual: State<'_, ManualSessions>,
+    dismissed: State<'_, DismissedSessions>,
     approved_prompts: State<'_, ApprovedPrompts>,
     paused_sessions: State<'_, PausedSessions>,
+    resumed_sessions: State<'_, ResumedSessions>,
+    auto_cache: State<'_, AutoDiscoveredCache>,
     app: AppHandle,
 ) -> Vec<AgentSession> {
     let action_ts = now_secs();
+    let existing_session = {
+        let cur = lock_or_recover(&state);
+        cur.iter().find(|s| s.id == id).cloned()
+    }
+    .or_else(|| {
+        let cache = lock_or_recover(&auto_cache.0);
+        cache.iter().find(|s| s.id == id).cloned()
+    })
+    .or_else(|| lock_or_recover(&manual).get(&id).cloned());
+
     {
         let mut paused_map = lock_or_recover(&paused_sessions.0);
         if paused_map.remove(&id).is_some() {
@@ -354,6 +374,13 @@ fn submit_agent_prompt(
     {
         let mut approved_map = lock_or_recover(&approved_prompts.0);
         approved_map.insert(id.clone(), (action_ts, approved));
+    }
+    if approved {
+        let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+        resumed_map.insert(id.clone(), action_ts);
+    } else {
+        let mut resumed_map = lock_or_recover(&resumed_sessions.0);
+        resumed_map.remove(&id);
     }
 
     {
@@ -372,213 +399,53 @@ fn submit_agent_prompt(
         }
     }
 
-    let mut workspace_hint: Option<String> = None;
-    let updated_list = {
-        let mut sessions = lock_or_recover(&state);
-        if let Some(session) = sessions.iter_mut().find(|s| s.id == id) {
-            workspace_hint = session.workspace_path.clone();
-            session.decision = Some(approved);
-            session.question = None;
-            session.updated_at = action_ts;
-            if approved {
-                session.status = "running".to_string();
-                session.step_label = "Submitted ⏎".to_string();
-            } else {
-                session.status = "done".to_string();
-                session.step_label = "Skipped".to_string();
+    let ws_hint = existing_session
+        .as_ref()
+        .and_then(|s| s.workspace_path.as_deref());
+    let chat_hint = existing_session.as_ref().and_then(|s| {
+        if s.id.starts_with("axiom-") {
+            None
+        } else {
+            Some(s.name.as_str())
+        }
+    });
+
+    dispatch_antigravity_ui_action(
+        if approved { "submit" } else { "deny" },
+        ws_hint,
+        chat_hint,
+        option,
+    );
+
+    if approved && id.starts_with("axiom-") {
+        if let Some(ref session) = existing_session {
+            let run_id = session.name.clone();
+            let model_opt = extract_model_for_axiom_run(ws_hint, &run_id, &session.task);
+            let axiom_ws_opt = resolve_axiom_workspace(ws_hint);
+            if let (Some(model), Some(axiom_ws)) = (model_opt, axiom_ws_opt) {
+                spawn_axiom_runner_background(
+                    run_id,
+                    model,
+                    axiom_ws,
+                    id.clone(),
+                    resumed_sessions.0.clone(),
+                    800,
+                );
             }
         }
-        sessions.sort_by(|a, b| {
-            status_rank(&a.status)
-                .cmp(&status_rank(&b.status))
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        sessions.clone()
-    };
-
-    let _ = app.emit("dinobuds-update", &updated_list);
-
-    #[cfg(target_os = "windows")]
-    {
-        let opt_str = option.map(|o| o.to_string()).unwrap_or_default();
-        let approved_str = if approved { "1" } else { "0" };
-        let ws_hint = workspace_hint
-            .and_then(|p| {
-                Path::new(&p)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_default();
-
-        std::thread::spawn(move || {
-            let script = r#"
-Start-Sleep -Milliseconds 80
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class DinoUiaMouse {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int X; public int Y; }
-    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    public static void ClickAt(int x, int y) {
-        POINT orig;
-        bool hasOrig = GetCursorPos(out orig);
-        SetCursorPos(x, y);
-        mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
-        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
-        if (hasOrig) { SetCursorPos(orig.X, orig.Y); }
-    }
-}
-"@
-
-$hint = $env:DINOBUDS_WS_HINT
-$opt = $env:DINOBUDS_OPTION
-$approved = $env:DINOBUDS_APPROVED -eq "1"
-
-$proc = $null
-if ($hint) {
-    $proc = Get-Process | Where-Object {
-        $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*Antigravity*" -and $_.MainWindowTitle -like "*$hint*"
-    } | Select-Object -First 1
-}
-if (-not $proc) {
-    $proc = Get-Process | Where-Object {
-        $_.MainWindowHandle -ne 0 -and ($_.ProcessName -match "Antigravity" -or $_.MainWindowTitle -like "*Antigravity*")
-    } | Select-Object -First 1
-}
-if (-not $proc -or $proc.MainWindowHandle -eq 0) { exit 0 }
-
-$hwnd = $proc.MainWindowHandle
-if ([DinoUiaMouse]::IsIconic($hwnd)) {
-    [void][DinoUiaMouse]::ShowWindowAsync($hwnd, 9)
-    Start-Sleep -Milliseconds 60
-}
-[void][DinoUiaMouse]::SetForegroundWindow($hwnd)
-Start-Sleep -Milliseconds 100
-
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-if (-not $root) { exit 0 }
-
-function Invoke-OrClickElement($el) {
-    if (-not $el) { return $false }
-    try {
-        $sel = $null
-        if ($el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {
-            ([System.Windows.Automation.SelectionItemPattern]$sel).Select()
-            return $true
-        }
-    } catch {}
-    try {
-        $inv = $null
-        if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$inv)) {
-            ([System.Windows.Automation.InvokePattern]$inv).Invoke()
-            return $true
-        }
-    } catch {}
-    try {
-        $rect = $el.Current.BoundingRectangle
-        if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and -not [double]::IsInfinity($rect.Left)) {
-            $cx = [int][Math]::Round($rect.Left + $rect.Width / 2.0)
-            $cy = [int][Math]::Round($rect.Top + $rect.Height / 2.0)
-            [DinoUiaMouse]::ClickAt($cx, $cy)
-            return $true
-        }
-    } catch {}
-    return $false
-}
-
-function Find-MatchingElement($elements, [string[]]$phrases) {
-    foreach ($phrase in $phrases) {
-        foreach ($el in $elements) {
-            try {
-                $rawName = $el.Current.Name
-                if (-not $rawName) { continue }
-                $trimmed = $rawName.Trim()
-                if ($trimmed.Length -eq 0 -or $trimmed.Length -gt 48) { continue }
-                $lower = $trimmed.ToLowerInvariant()
-                if ($lower.Contains($phrase)) {
-                    return $el
-                }
-            } catch {}
-        }
-    }
-    return $null
-}
-
-$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-
-if ($approved -and ($opt -eq "2" -or $opt -eq "3")) {
-    $optTarget = $null
-    if ($opt -eq "2") {
-        $optTarget = Find-MatchingElement $all @("yes, and always allow", "always allow", "always", "2.")
-    } else {
-        foreach ($el in $all) {
-            try {
-                $name = $el.Current.Name
-                if (-not $name -or $name.Length -gt 48) { continue }
-                $lower = $name.ToLowerInvariant()
-                if (($lower.StartsWith("yes, and ") -and -not $lower.Contains("always")) -or $name -eq "3" -or $name.StartsWith("3.")) {
-                    $optTarget = $el
-                    break
-                }
-            } catch {}
-        }
-    }
-    if ($optTarget) {
-        [void](Invoke-OrClickElement $optTarget)
-        Start-Sleep -Milliseconds 60
-    }
-}
-
-$btnCond = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Button
-)
-$buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
-
-$targetPhrases = if ($approved -and $opt -eq "2") {
-    @("always allow", "yes, and always", "submit", "allow", "approve", "run", "accept")
-} elseif ($approved) {
-    @("submit", "allow", "approve", "run", "accept", "continue", "yes")
-} else {
-    @("skip", "deny", "reject", "cancel")
-}
-
-$btnTarget = Find-MatchingElement $buttons $targetPhrases
-if (-not $btnTarget) {
-    $btnTarget = Find-MatchingElement $all $targetPhrases
-}
-if ($btnTarget) {
-    [void](Invoke-OrClickElement $btnTarget)
-}
-"#;
-            let _ = Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    script,
-                ])
-                .env("DINOBUDS_WS_HINT", ws_hint)
-                .env("DINOBUDS_OPTION", opt_str)
-                .env("DINOBUDS_APPROVED", approved_str)
-                .creation_flags(0x08000000)
-                .spawn();
-        });
     }
 
-    updated_list
+    let cached_auto = lock_or_recover(&auto_cache.0).clone();
+    reconcile_and_emit(
+        &state,
+        &manual,
+        &dismissed,
+        &approved_prompts,
+        &paused_sessions,
+        &resumed_sessions,
+        &cached_auto,
+        &app,
+    )
 }
 
 #[tauri::command]
@@ -735,23 +602,163 @@ fn has_live_axiom_process(run_id: &str) -> bool {
     list_live_axiom_run_ids().contains(&needle)
 }
 
-fn trigger_antigravity_resume_ui(ws_hint: Option<&str>) {
+fn kill_axiom_run_processes(run_id: &str) {
+    let needle = run_id.trim().to_lowercase();
+    if needle.is_empty() {
+        return;
+    }
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
+    let mut pids_to_kill: Vec<u32> = Vec::new();
+    for (pid, proc_info) in sys.processes() {
+        let name = proc_info.name().to_string_lossy().to_lowercase();
+        if !name.contains("node") && !name.contains("cmd") {
+            continue;
+        }
+        let args: Vec<String> = proc_info
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        let joined = args.join(" ").to_lowercase();
+        if !joined.contains("ablation") || !joined.contains("--run-id") {
+            continue;
+        }
+        let mut matched = false;
+        for i in 0..args.len() {
+            if args[i] == "--run-id" {
+                if let Some(val) = args.get(i + 1) {
+                    if val.trim().trim_matches('"').eq_ignore_ascii_case(&needle) {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else if let Some(val) = args[i].strip_prefix("--run-id=") {
+                if val.trim().trim_matches('"').eq_ignore_ascii_case(&needle) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if matched {
+            pids_to_kill.push(pid.as_u32());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    for pid in pids_to_kill {
+        let _ = Command::new("taskkill.exe")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000)
+            .output();
+    }
+}
+
+fn spawn_axiom_runner_background(
+    run_id: String,
+    model: String,
+    axiom_ws: PathBuf,
+    session_id: String,
+    resumed_ref: Arc<Mutex<HashMap<String, u64>>>,
+    initial_delay_ms: u64,
+) {
+    #[cfg(target_os = "windows")]
+    std::thread::spawn(move || {
+        if initial_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(initial_delay_ms));
+        }
+        if has_live_axiom_process(&run_id) {
+            return;
+        }
+        let log_path = get_user_profile_dir().map(|h| {
+            h.join(".dinobuds")
+                .join("logs")
+                .join(format!("axiom-{}.log", sanitize_id(&run_id)))
+        });
+        let npx_bin = if Path::new(r"C:\Program Files\nodejs\npx.cmd").is_file() {
+            r"C:\Program Files\nodejs\npx.cmd"
+        } else {
+            "npx.cmd"
+        };
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let enriched_path = format!(r"C:\Program Files\nodejs;{}", current_path);
+
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args([
+            "/C",
+            npx_bin,
+            "tsx",
+            "src/eval/ablation-v3.ts",
+            "--model",
+            &model,
+            "--run-id",
+            &run_id,
+            "--allow-dirty",
+        ])
+        .current_dir(&axiom_ws)
+        .env("PATH", enriched_path)
+        .creation_flags(0x08000000);
+
+        if let Some(ref lp) = log_path {
+            if let Some(parent) = lp.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(file) = File::create(lp) {
+                if let Ok(err_file) = file.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(file));
+                    cmd.stderr(std::process::Stdio::from(err_file));
+                }
+            }
+        }
+
+        if let Ok(mut child) = cmd.spawn() {
+            let _ = child.wait();
+            let mut rmap = lock_or_recover(&resumed_ref);
+            rmap.remove(&session_id);
+        } else {
+            let mut rmap = lock_or_recover(&resumed_ref);
+            rmap.remove(&session_id);
+        }
+    });
+}
+
+fn dispatch_antigravity_ui_action(
+    mode: &str,
+    ws_hint: Option<&str>,
+    chat_hint: Option<&str>,
+    option: Option<u8>,
+) {
     #[cfg(target_os = "windows")]
     {
-        let hint = ws_hint
-            .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+        let mode_str = mode.to_string();
+        let folder_hint = ws_hint
+            .and_then(|p| {
+                let trimmed = p.trim().trim_end_matches(['\\', '/']);
+                Path::new(trimmed)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .or(Some(trimmed))
+            })
             .unwrap_or("")
             .to_string();
+        let full_ws_path = ws_hint.unwrap_or("").trim().to_string();
+        let chat_str = chat_hint.unwrap_or("").trim().to_string();
+        let opt_str = option.map(|o| o.to_string()).unwrap_or_default();
 
         std::thread::spawn(move || {
             let script = r#"
 Start-Sleep -Milliseconds 60
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-public static class DinoResumeWin {
+public static class DinoUiaCtrl {
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
@@ -771,59 +778,377 @@ public static class DinoResumeWin {
 }
 "@
 
-$hint = $env:DINOBUDS_WS_HINT
+$mode = $env:DINOBUDS_UI_MODE
+$wsHint = $env:DINOBUDS_WS_HINT
+$fullWs = $env:DINOBUDS_FULL_WS
+$chatHint = $env:DINOBUDS_CHAT_HINT
+$opt = $env:DINOBUDS_OPTION
+
+$agProcs = @(Get-Process | Where-Object {
+    $_.MainWindowHandle -ne 0 -and ($_.ProcessName -match "Antigravity" -or $_.MainWindowTitle -like "*Antigravity*")
+})
+
+if ($agProcs.Count -eq 0) {
+    if ($mode -eq "focus" -and $fullWs) {
+        Start-Process explorer.exe -ArgumentList $fullWs
+    }
+    exit 0
+}
+
 $proc = $null
-if ($hint) {
-    $proc = Get-Process | Where-Object {
-        $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*Antigravity*" -and $_.MainWindowTitle -like "*$hint*"
+if ($wsHint) {
+    $proc = $agProcs | Where-Object {
+        $_.MainWindowTitle -like "* - $wsHint - *" -or $_.MainWindowTitle -like "*$wsHint*"
     } | Select-Object -First 1
 }
 if (-not $proc) {
-    $proc = Get-Process | Where-Object {
-        $_.MainWindowHandle -ne 0 -and ($_.ProcessName -match "Antigravity" -or $_.MainWindowTitle -like "*Antigravity*")
-    } | Select-Object -First 1
+    $proc = $agProcs[0]
 }
-if (-not $proc -or $proc.MainWindowHandle -eq 0) { exit 0 }
 
 $hwnd = $proc.MainWindowHandle
-if ([DinoResumeWin]::IsIconic($hwnd)) {
-    [void][DinoResumeWin]::ShowWindowAsync($hwnd, 9)
-    Start-Sleep -Milliseconds 60
+if ([DinoUiaCtrl]::IsIconic($hwnd)) {
+    [void][DinoUiaCtrl]::ShowWindowAsync($hwnd, 9)
+    Start-Sleep -Milliseconds 70
 }
-[void][DinoResumeWin]::SetForegroundWindow($hwnd)
+[void][DinoUiaCtrl]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 100
 
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 if (-not $root) { exit 0 }
 
-$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-$phrases = @("submit", "allow", "accept", "continue", "retry", "run command", "run")
-foreach ($phrase in $phrases) {
-    foreach ($el in $all) {
+function Invoke-OrClick($el, [int]$xOffset = 0) {
+    if (-not $el) { return $false }
+    if ($xOffset -le 0) {
         try {
-            $ct = $el.Current.ControlType
-            if ($ct -ne [System.Windows.Automation.ControlType]::Button) { continue }
-            $rawName = $el.Current.Name
-            if (-not $rawName) { continue }
-            $trimmed = $rawName.Trim()
-            if ($trimmed.Length -eq 0 -or $trimmed.Length -gt 36) { continue }
-            if ($trimmed.ToLowerInvariant().Contains($phrase)) {
-                try {
-                    $inv = $null
-                    if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$inv)) {
-                        ([System.Windows.Automation.InvokePattern]$inv).Invoke()
-                        exit 0
-                    }
-                } catch {}
-                try {
-                    $rect = $el.Current.BoundingRectangle
-                    if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and -not [double]::IsInfinity($rect.Left)) {
-                        [DinoResumeWin]::ClickAt([int][Math]::Round($rect.Left + $rect.Width / 2.0), [int][Math]::Round($rect.Top + $rect.Height / 2.0))
-                        exit 0
-                    }
-                } catch {}
+            $sel = $null
+            if ($el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {
+                ([System.Windows.Automation.SelectionItemPattern]$sel).Select()
+                return $true
             }
         } catch {}
+        try {
+            $inv = $null
+            if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$inv)) {
+                ([System.Windows.Automation.InvokePattern]$inv).Invoke()
+                return $true
+            }
+        } catch {}
+    }
+    try {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 0 -and $r.Height -gt 0 -and -not [double]::IsInfinity($r.Left)) {
+            $cx = if ($xOffset -gt 0) { [int][Math]::Round($r.Left + [Math]::Min($xOffset, $r.Width * 0.45)) } else { [int][Math]::Round($r.Left + $r.Width / 2.0) }
+            $cy = [int][Math]::Round($r.Top + $r.Height / 2.0)
+            [DinoUiaCtrl]::ClickAt($cx, $cy)
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+function Is-NoiseElement([string]$name) {
+    if (-not $name) { return $true }
+    $n = $name.Trim()
+    if ($n.Length -eq 0) { return $true }
+    $prefixes = @(
+        "Running ", "Ran ", "Worked for ", "Explored ", "Close ", "Copy",
+        "Good response", "Bad response", "Undo to this point", "Select model",
+        "Agent permissions", "Add context", "Record voice", "Start Voice",
+        "Toggle ", "Review", "Load older", "Pin conversation", "Archive conversation",
+        "More options", "Project options", "New Conversation"
+    )
+    foreach ($p in $prefixes) {
+        if ($n.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+
+# Locate project folder slice in sidebar (Left < 320)
+$projButtons = @()
+foreach ($el in $all) {
+    try {
+        if ($el.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) { continue }
+        $r = $el.Current.BoundingRectangle
+        $n = $el.Current.Name
+        if ($n -and $r.Left -ge 0 -and $r.Left -lt 60 -and $r.Width -ge 180 -and $r.Top -ge 180) {
+            if ($n -notin @("Automations", "Settings", "Projects")) {
+                $projButtons += [PSCustomObject]@{ El = $el; Name = $n.Trim(); Top = $r.Top; Bottom = $r.Top + $r.Height }
+            }
+        }
+    } catch {}
+}
+$projButtons = @($projButtons | Sort-Object Top)
+
+$targetProj = $null
+$nextProjTop = 99999
+if ($wsHint -and $projButtons.Count -gt 0) {
+    for ($i = 0; $i -lt $projButtons.Count; $i++) {
+        if ($projButtons[$i].Name -ieq $wsHint) {
+            $targetProj = $projButtons[$i]
+            if ($i + 1 -lt $projButtons.Count) {
+                $nextProjTop = $projButtons[$i + 1].Top
+            }
+            break
+        }
+    }
+}
+
+# Fast-path for PAUSE: click inline [Stop execution] in the project's sidebar slice or active pane
+if ($mode -eq "pause") {
+    $stopCandidates = @()
+    foreach ($el in $all) {
+        try {
+            if ($el.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) { continue }
+            $n = $el.Current.Name
+            if ($n -eq "Stop execution") {
+                $r = $el.Current.BoundingRectangle
+                if ($targetProj) {
+                    if ($r.Top -ge $targetProj.Top -and $r.Top -lt $nextProjTop) {
+                        $stopCandidates += $el
+                    }
+                } else {
+                    $stopCandidates += $el
+                }
+            }
+        } catch {}
+    }
+    if ($stopCandidates.Count -gt 0) {
+        [void](Invoke-OrClick $stopCandidates[0])
+        exit 0
+    }
+    $winTitle = $root.Current.Name
+    if (-not $wsHint -or $winTitle -like "*$wsHint*") {
+        foreach ($el in $all) {
+            try {
+                if ($el.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $el.Current.Name -like "Cancel*") {
+                    $r = $el.Current.BoundingRectangle
+                    if ($r.Left -gt 320 -and $r.Top -gt 500) {
+                        [void](Invoke-OrClick $el)
+                        exit 0
+                    }
+                }
+            } catch {}
+        }
+    }
+    exit 0
+}
+
+# Switch to target workspace/conversation in sidebar if not already active
+$winTitle = $root.Current.Name
+$needSwitch = $false
+if ($wsHint -and $winTitle -notlike "* - $wsHint - *" -and $winTitle -notlike "*$wsHint*") {
+    $needSwitch = $true
+} elseif ($chatHint -and $winTitle -notlike "$chatHint*") {
+    $needSwitch = $true
+}
+
+if ($needSwitch -and $targetProj) {
+    $chatLinks = @()
+    $stopTops = @()
+    foreach ($el in $all) {
+        try {
+            $r = $el.Current.BoundingRectangle
+            if ($r.Left -lt 0 -or $r.Left -ge 320) { continue }
+            if ($r.Top -le $targetProj.Top -or $r.Top -ge $nextProjTop) { continue }
+            $ct = $el.Current.ControlType
+            $n = $el.Current.Name
+            if ($ct -eq [System.Windows.Automation.ControlType]::Hyperlink -and $n -and $n -ne "New Conversation in Project") {
+                $chatLinks += [PSCustomObject]@{ El = $el; Name = $n.Trim(); Top = $r.Top }
+            } elseif ($ct -eq [System.Windows.Automation.ControlType]::Button -and $n -eq "Stop execution") {
+                $stopTops += $r.Top
+            }
+        } catch {}
+    }
+
+    # If project is collapsed in sidebar, click project header to expand it
+    if ($chatLinks.Count -eq 0) {
+        [void](Invoke-OrClick $targetProj.El 75)
+        Start-Sleep -Milliseconds 180
+        $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($el in $all) {
+            try {
+                $r = $el.Current.BoundingRectangle
+                if ($r.Left -ge 0 -and $r.Left -lt 320 -and $r.Top -gt $targetProj.Top -and $r.Top -lt ($targetProj.Top + 260)) {
+                    $ct = $el.Current.ControlType
+                    $n = $el.Current.Name
+                    if ($ct -eq [System.Windows.Automation.ControlType]::Hyperlink -and $n -and $n -ne "New Conversation in Project") {
+                        $chatLinks += [PSCustomObject]@{ El = $el; Name = $n.Trim(); Top = $r.Top }
+                    } elseif ($ct -eq [System.Windows.Automation.ControlType]::Button -and $n -eq "Stop execution") {
+                        $stopTops += $r.Top
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    $chosenLink = $null
+    if ($chatHint -and $chatLinks.Count -gt 0) {
+        $chosenLink = $chatLinks | Where-Object { $_.Name -ieq $chatHint -or $_.Name -like "*$chatHint*" } | Select-Object -First 1
+    }
+    if (-not $chosenLink -and $stopTops.Count -gt 0 -and $chatLinks.Count -gt 0) {
+        foreach ($cl in $chatLinks) {
+            foreach ($st in $stopTops) {
+                if ([Math]::Abs($cl.Top - $st) -le 14) {
+                    $chosenLink = $cl
+                    break
+                }
+            }
+            if ($chosenLink) { break }
+        }
+    }
+    if (-not $chosenLink -and $chatLinks.Count -gt 0) {
+        $chosenLink = $chatLinks[0]
+    }
+
+    if ($chosenLink) {
+        [void](Invoke-OrClick $chosenLink.El 75)
+        Start-Sleep -Milliseconds 260
+        $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    }
+}
+
+if ($mode -eq "focus") {
+    exit 0
+}
+
+# Filter elements inside the main chat pane (Left > 320, Top > 60)
+$paneEls = @()
+foreach ($el in $all) {
+    try {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Left -gt 320 -and $r.Top -gt 60 -and $r.Width -gt 0 -and $r.Height -gt 0 -and -not [double]::IsInfinity($r.Left)) {
+            $paneEls += $el
+        }
+    } catch {}
+}
+
+function Find-ApprovalOption([string]$optionCode) {
+    $candidates = @()
+    foreach ($el in $paneEls) {
+        try {
+            $n = $el.Current.Name
+            if (-not $n) { continue }
+            $t = $n.Trim()
+            $lower = $t.ToLowerInvariant()
+            if ($optionCode -eq "2") {
+                if ($lower.StartsWith("yes, and always allow") -or $lower.StartsWith("always allow") -or $lower.StartsWith("2.")) {
+                    $candidates += [PSCustomObject]@{ El = $el; Text = $lower; Top = $el.Current.BoundingRectangle.Top }
+                }
+            } elseif ($optionCode -eq "3") {
+                if (($lower.StartsWith("yes, and always allow") -and -not $lower.Contains("in this conversation")) -or $lower.StartsWith("3.")) {
+                    $candidates += [PSCustomObject]@{ El = $el; Text = $lower; Top = $el.Current.BoundingRectangle.Top }
+                }
+            } else {
+                if ($lower.StartsWith("yes, allow this time") -or $lower.StartsWith("yes, allow") -or $lower -eq "yes" -or $lower.StartsWith("1.")) {
+                    $candidates += [PSCustomObject]@{ El = $el; Text = $lower; Top = $el.Current.BoundingRectangle.Top }
+                }
+            }
+        } catch {}
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    if ($optionCode -eq "2") {
+        $inConv = $candidates | Where-Object { $_.Text.Contains("in this conversation") } | Sort-Object Top -Descending | Select-Object -First 1
+        if ($inConv) { return $inConv.El }
+    }
+    return ($candidates | Sort-Object Top -Descending | Select-Object -First 1).El
+}
+
+function Find-SubmitActionBtn([string[]]$exactOrPrefixes) {
+    $matched = @()
+    foreach ($el in $paneEls) {
+        try {
+            $n = $el.Current.Name
+            if (-not $n -or (Is-NoiseElement $n)) { continue }
+            $t = $n.Trim()
+            if ($t.Length -gt 36) { continue }
+            $lower = $t.ToLowerInvariant()
+            foreach ($p in $exactOrPrefixes) {
+                if ($lower -eq $p -or $lower.StartsWith("$p ") -or $lower.StartsWith("$p(") -or $lower.StartsWith("$p⏎")) {
+                    $matched += [PSCustomObject]@{ El = $el; Top = $el.Current.BoundingRectangle.Top }
+                    break
+                }
+            }
+        } catch {}
+    }
+    if ($matched.Count -eq 0) { return $null }
+    return ($matched | Sort-Object Top -Descending | Select-Object -First 1).El
+}
+
+if ($mode -eq "submit") {
+    $optEl = Find-ApprovalOption $opt
+    if (-not $optEl -and $opt -ne "1") {
+        $optEl = Find-ApprovalOption "1"
+    }
+    if ($optEl) {
+        [void](Invoke-OrClick $optEl 40)
+        Start-Sleep -Milliseconds 90
+    }
+    $submitBtn = Find-SubmitActionBtn @("submit", "allow", "approve", "accept", "run command", "continue")
+    if ($submitBtn) {
+        [void](Invoke-OrClick $submitBtn)
+        Start-Sleep -Milliseconds 60
+    }
+    if ($optEl -or $submitBtn) {
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    }
+    exit 0
+}
+
+if ($mode -eq "deny") {
+    $denyBtn = Find-SubmitActionBtn @("skip", "deny", "reject", "no", "cancel")
+    if ($denyBtn) {
+        [void](Invoke-OrClick $denyBtn)
+        Start-Sleep -Milliseconds 60
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    } else {
+        [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
+    }
+    exit 0
+}
+
+if ($mode -eq "resume") {
+    $optEl = Find-ApprovalOption "1"
+    $submitBtn = Find-SubmitActionBtn @("submit", "allow", "approve", "accept", "run command", "continue", "retry", "resume")
+    if ($optEl -or $submitBtn) {
+        if ($optEl) {
+            [void](Invoke-OrClick $optEl 40)
+            Start-Sleep -Milliseconds 90
+        }
+        if ($submitBtn) {
+            [void](Invoke-OrClick $submitBtn)
+            Start-Sleep -Milliseconds 60
+        }
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        exit 0
+    }
+
+    # Check if already running (Cancel (Ctrl+D) present in bottom input bar)
+    foreach ($el in $paneEls) {
+        try {
+            if ($el.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $el.Current.Name -like "Cancel*") {
+                exit 0
+            }
+        } catch {}
+    }
+
+    # Click the chat input prompt ("Ask anything...") and send "continue" + Enter
+    $chatBox = $null
+    foreach ($el in $paneEls) {
+        try {
+            $n = $el.Current.Name
+            $r = $el.Current.BoundingRectangle
+            if ($r.Top -gt 400 -and $n -and ($n -like "Ask anything*" -or $n -like "*@ to mention*")) {
+                $chatBox = $el
+                break
+            }
+        } catch {}
+    }
+    if ($chatBox) {
+        [void](Invoke-OrClick $chatBox 60)
+        Start-Sleep -Milliseconds 90
+        [System.Windows.Forms.SendKeys]::SendWait("continue{ENTER}")
     }
 }
 "#;
@@ -836,7 +1161,11 @@ foreach ($phrase in $phrases) {
                     "-Command",
                     script,
                 ])
-                .env("DINOBUDS_WS_HINT", hint)
+                .env("DINOBUDS_UI_MODE", mode_str)
+                .env("DINOBUDS_WS_HINT", folder_hint)
+                .env("DINOBUDS_FULL_WS", full_ws_path)
+                .env("DINOBUDS_CHAT_HINT", chat_str)
+                .env("DINOBUDS_OPTION", opt_str)
                 .creation_flags(0x08000000)
                 .spawn();
         });
@@ -875,6 +1204,17 @@ fn toggle_pause_session(
                 .unwrap_or(false)
     };
 
+    let ws_hint = existing_session
+        .as_ref()
+        .and_then(|s| s.workspace_path.as_deref());
+    let chat_hint = existing_session.as_ref().and_then(|s| {
+        if s.id.starts_with("axiom-") {
+            None
+        } else {
+            Some(s.name.as_str())
+        }
+    });
+
     if is_currently_paused {
         {
             let mut paused_map = lock_or_recover(&paused_sessions.0);
@@ -896,70 +1236,25 @@ fn toggle_pause_session(
             }
         }
 
-        let mut launched_axiom = false;
         if id.starts_with("axiom-") {
             if let Some(ref session) = existing_session {
                 let run_id = session.name.clone();
-                let ws_hint = session.workspace_path.as_deref();
                 let model_opt = extract_model_for_axiom_run(ws_hint, &run_id, &session.task);
                 let axiom_ws_opt = resolve_axiom_workspace(ws_hint);
-
-                #[cfg(target_os = "windows")]
                 if let (Some(model), Some(axiom_ws)) = (model_opt, axiom_ws_opt) {
-                    launched_axiom = true;
-                    let resumed_ref = resumed_sessions.0.clone();
-                    let session_id = id.clone();
-                    std::thread::spawn(move || {
-                        if has_live_axiom_process(&run_id) {
-                            return;
-                        }
-                        let log_path = get_user_profile_dir()
-                            .map(|h| h.join(".dinobuds").join("logs").join(format!("axiom-{}.log", sanitize_id(&run_id))));
-                        let mut cmd = Command::new("cmd.exe");
-                        cmd.args([
-                            "/C",
-                            "npx.cmd",
-                            "tsx",
-                            "src/eval/ablation-v3.ts",
-                            "--model",
-                            &model,
-                            "--run-id",
-                            &run_id,
-                            "--allow-dirty",
-                        ])
-                        .current_dir(&axiom_ws)
-                        .creation_flags(0x08000000);
-
-                        if let Some(ref lp) = log_path {
-                            if let Some(parent) = lp.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-                            if let Ok(file) = File::create(lp) {
-                                if let Ok(err_file) = file.try_clone() {
-                                    cmd.stdout(std::process::Stdio::from(file));
-                                    cmd.stderr(std::process::Stdio::from(err_file));
-                                }
-                            }
-                        }
-
-                        if let Ok(mut child) = cmd.spawn() {
-                            let _ = child.wait();
-                            let mut rmap = lock_or_recover(&resumed_ref);
-                            rmap.remove(&session_id);
-                        } else {
-                            let mut rmap = lock_or_recover(&resumed_ref);
-                            rmap.remove(&session_id);
-                        }
-                    });
+                    spawn_axiom_runner_background(
+                        run_id,
+                        model,
+                        axiom_ws,
+                        id.clone(),
+                        resumed_sessions.0.clone(),
+                        0,
+                    );
                 }
             }
-        }
-
-        if !launched_axiom {
-            let ws_hint = existing_session
-                .as_ref()
-                .and_then(|s| s.workspace_path.as_deref());
-            trigger_antigravity_resume_ui(ws_hint);
+            dispatch_antigravity_ui_action("submit", ws_hint, None, Some(1));
+        } else {
+            dispatch_antigravity_ui_action("resume", ws_hint, chat_hint, Some(1));
         }
     } else {
         {
@@ -998,33 +1293,17 @@ fn toggle_pause_session(
                 .as_ref()
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| id.trim_start_matches("axiom-").to_string());
-
-            #[cfg(target_os = "windows")]
             if !run_id.is_empty() {
                 std::thread::spawn(move || {
-                    let script = r#"
-$runId = $env:DINOBUDS_RUN_ID
-if (-not $runId) { exit 0 }
-Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'cmd.exe'" | Where-Object {
-    $_.CommandLine -and $_.CommandLine -like "*--run-id*$runId*"
-} | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-"#;
-                    let _ = Command::new("powershell.exe")
-                        .args([
-                            "-NoProfile",
-                            "-NonInteractive",
-                            "-WindowStyle",
-                            "Hidden",
-                            "-Command",
-                            script,
-                        ])
-                        .env("DINOBUDS_RUN_ID", run_id)
-                        .creation_flags(0x08000000)
-                        .spawn();
+                    kill_axiom_run_processes(&run_id);
                 });
             }
+        } else if existing_session
+            .as_ref()
+            .map(|s| s.status == "running")
+            .unwrap_or(false)
+        {
+            dispatch_antigravity_ui_action("pause", ws_hint, chat_hint, None);
         }
     }
 
@@ -1044,14 +1323,8 @@ Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'cmd.exe'" | 
 #[tauri::command]
 fn focus_workspace(path: String) -> Result<(), String> {
     println!("[DinoBuds] Focusing workspace: {}", path);
-    #[cfg(target_os = "windows")]
-    {
-        if !path.trim().is_empty() {
-            let _ = Command::new("cmd")
-                .args(["/C", "start", "", &path])
-                .spawn()
-                .map_err(|e| e.to_string())?;
-        }
+    if !path.trim().is_empty() {
+        dispatch_antigravity_ui_action("focus", Some(path.as_str()), None, None);
     }
     Ok(())
 }
